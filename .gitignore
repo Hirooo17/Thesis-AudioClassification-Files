@@ -1,10 +1,21 @@
 # 1. Ignore ALL files and folders
 **/*
 
-# 2. But, DO NOT ignore the file you want
+# 2. But, DO NOT ignore the files you want in the root
 !/AudioClassification.ipynb
 !/main.py
 !/gui.py
-!/Models/**
-# 3. (Optional but recommended) DO NOT ignore this .gitignore file itself
+
+# 3. IMPORTANT: Un-ignore the 'Models' directory
+# This allows Git to look inside this folder
+!/Models
+
+# 4. Now, un-ignore the specific files *inside* the Models directory
+!/Models/KNN.py
+!/Models/SVM.py
+!/Models/CNN.py
+!/Models/RandomForest.py
+!/Models/XGBoost.py
+
+# 5. (Optional but recommended) DO NOT ignore this .gitignore file itself
 !/.gitignore
