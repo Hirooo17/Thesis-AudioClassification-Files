@@ -5,6 +5,7 @@
 !/AudioClassification.ipynb
 !/main.py
 !/gui.py
+!/SNR_MFCC_IMPLEMENTATION.md
 
 # 3. IMPORTANT: Un-ignore the 'Models' directory
 # This allows Git to look inside this folder

@@ -6,7 +6,7 @@ import joblib
 import os
 
 
-# Cell: Full-Featured KNN Model Setup
+#  sCell: Full-Featured KNN Model Setup
 class KNNAudioClassifier:
     def __init__(self, n_neighbors=15, weights='uniform', algorithm='auto', random_state=42):
         """
