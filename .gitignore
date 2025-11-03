@@ -5,6 +5,6 @@
 !/AudioClassification.ipynb
 !/main.py
 !/gui.py
-
+!/Models/**
 # 3. (Optional but recommended) DO NOT ignore this .gitignore file itself
 !/.gitignore

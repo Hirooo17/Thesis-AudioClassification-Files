@@ -1,6 +1,6 @@
 import datetime
 import tensorflow as tf
-import tensorflow_io as tfio
+import librosa
 import numpy as np  
 import os
 import pickle
@@ -22,12 +22,17 @@ from Models.XgBoost import XGBoostAudioClassifier
 # ============================================================================
 
 def load_wav_16k_mono(filename):
-    """Load and resample audio to 16kHz mono"""
-    file_contents = tf.io.read_file(filename)
-    wav, sample_rate = tf.audio.decode_wav(file_contents, desired_channels=1)
-    wav = tf.squeeze(wav, axis=-1)
-    sample_rate = tf.cast(sample_rate, tf.int64)
-    wav = tfio.audio.resample(wav, rate_in=sample_rate, rate_out=16000)
+    """Load and resample audio to 16kHz mono using librosa"""
+    # Decode filename from tensor if needed
+    if isinstance(filename, tf.Tensor):
+        filename = filename.numpy().decode('utf-8')
+    
+    # Load audio with librosa (automatically resamples to target sr)
+    wav, sample_rate = librosa.load(filename, sr=16000, mono=True)
+    
+    # Convert to TensorFlow tensor
+    wav = tf.convert_to_tensor(wav, dtype=tf.float32)
+    
     return wav
 
 
@@ -679,21 +684,69 @@ def quick_load_snr_datasets(snr_levels=[5, 10, 15, 20], save_dir='saved_datasets
     
     return loaded_datasets
 
-def list_saved_models():
-    """List all saved model files"""
-    model_files = [f for f in os.listdir('.') if f.startswith('rf_model') and (f.endswith('.joblib') or f.endswith('.pkl'))]
-    print("📁 Saved Models:")
-    for i, model_file in enumerate(model_files, 1):
-        size = os.path.getsize(model_file) / 1024**2
-        print(f"  {i}. {model_file} ({size:.2f} MB)")
+def list_saved_models(verbose=True):
+    """
+    List all saved model files (.joblib and .pkl)
+    
+    Args:
+        verbose: If True, print model list. If False, return silently.
+    
+    Returns:
+        Dictionary with model type as key and list of files as value
+    """
+    # Get all .joblib and .pkl files in current directory
+    all_files = [f for f in os.listdir('.') if f.endswith('.joblib') or f.endswith('.pkl')]
+    
+    # Categorize by model type
+    model_files = {
+        'RandomForest': [],
+        'KNN': [],
+        'SVM': [],
+        'XGBoost': [],
+        'CNN': [],
+        'Other': []
+    }
+    
+    for file in all_files:
+        file_lower = file.lower()
+        if 'rf' in file_lower or 'random' in file_lower or 'forest' in file_lower:
+            model_files['RandomForest'].append(file)
+        elif 'knn' in file_lower or 'k_nearest' in file_lower or 'neighbor' in file_lower:
+            model_files['KNN'].append(file)
+        elif 'svm' in file_lower or 'support' in file_lower or 'vector' in file_lower:
+            model_files['SVM'].append(file)
+        elif 'xgb' in file_lower or 'xgboost' in file_lower or 'boost' in file_lower:
+            model_files['XGBoost'].append(file)
+        elif 'cnn' in file_lower or 'conv' in file_lower or 'neural' in file_lower:
+            model_files['CNN'].append(file)
+        else:
+            model_files['Other'].append(file)
+    
+    if verbose:
+        print("📁 Saved Model Files:")
+        total_count = 0
+        for model_type, files in model_files.items():
+            if files:
+                print(f"\n  🔹 {model_type} Models ({len(files)}):")
+                for file in files:
+                    size = os.path.getsize(file) / 1024**2
+                    print(f"     • {file} ({size:.2f} MB)")
+                    total_count += 1
+        
+        if total_count == 0:
+            print("  ⚠️ No saved model files found")
+        else:
+            print(f"\n  ✅ Total: {total_count} model file(s)")
+    
     return model_files
 
-def load_model(filepath):
+def load_model(filepath, verbose=True):
     """
     Load a saved model from file and return it as a usable object
     
     Args:
         filepath: Path to the saved model file (.joblib or .pkl)
+        verbose: If True, print detailed loading information
     
     Returns:
         Loaded model object ready to use
@@ -703,53 +756,62 @@ def load_model(filepath):
         predictions = rf_model_full.predict(X_test)
     """
     if not os.path.exists(filepath):
-        print(f"❌ File not found: {filepath}")
-        print(f"📁 Available models:")
-        list_saved_models()
+        if verbose:
+            print(f"❌ File not found: {filepath}")
+            print(f"📁 Available models:")
+            list_saved_models()
         return None
     
     try:
         # Try loading with joblib first (recommended for sklearn models)
-        print(f"📂 Loading model from: {filepath}")
+        if verbose:
+            print(f"📂 Loading model from: {filepath}")
+        
         model = joblib.load(filepath)
         
-        print(f"✅ Model loaded successfully!")
-        print(f"📊 Model type: {type(model).__name__}")
-        
-        # Check if model is fitted
-        if hasattr(model, 'is_fitted'):
-            print(f"🔧 Model fitted: {model.is_fitted}")
-        
-        # Display model summary if available
-        if hasattr(model, 'summary'):
-            print("\n📋 Model Summary:")
-            model.summary()
-        
-        print(f"\n✅ Model ready to use! You can now call:")
-        print(f"   • model.predict(X_test)")
-        print(f"   • model.summary()")
+        if verbose:
+            print(f"✅ Model loaded successfully!")
+            print(f"📊 Model type: {type(model).__name__}")
+            
+            # Check if model is fitted
+            if hasattr(model, 'is_fitted'):
+                print(f"🔧 Model fitted: {model.is_fitted}")
+            
+            # Display model summary if available
+            if hasattr(model, 'summary'):
+                print("\n📋 Model Summary:")
+                model.summary()
+            
+            print(f"\n✅ Model ready to use! You can now call:")
+            print(f"   • model.predict(X_test)")
+            print(f"   • model.summary()")
         
         return model
         
     except Exception as e:
-        print(f"❌ Error loading with joblib: {e}")
+        if verbose:
+            print(f"❌ Error loading with joblib: {e}")
         
         # Fallback to pickle
         try:
-            print("🔄 Trying pickle method...")
+            if verbose:
+                print("🔄 Trying pickle method...")
+            
             with open(filepath, 'rb') as f:
                 model = pickle.load(f)
             
-            print(f"✅ Model loaded successfully with pickle!")
-            print(f"📊 Model type: {type(model).__name__}")
-            
-            if hasattr(model, 'is_fitted'):
-                print(f"🔧 Model fitted: {model.is_fitted}")
+            if verbose:
+                print(f"✅ Model loaded successfully with pickle!")
+                print(f"📊 Model type: {type(model).__name__}")
+                
+                if hasattr(model, 'is_fitted'):
+                    print(f"🔧 Model fitted: {model.is_fitted}")
             
             return model
             
         except Exception as e2:
-            print(f"❌ Error loading with pickle: {e2}")
+            if verbose:
+                print(f"❌ Error loading with pickle: {e2}")
             return None
 
 def delete_model(filepath):
@@ -812,32 +874,171 @@ print("="*70)
 print("\n📁 Currently Available Models:")
 saved_models = list_saved_models()
 
+def auto_load_all_models():
+    """
+    Automatically detect and load all saved model files
+    
+    Returns:
+        Dictionary with model instances, organized by type
+    """
+    print("\n🔍 Auto-detecting saved models...")
+    print("="*70)
+    
+    model_files = list_saved_models(verbose=False)
+    loaded_models = {}
+    
+    # Load Random Forest models
+    if model_files['RandomForest']:
+        print(f"\n📦 Loading Random Forest models...")
+        for file in model_files['RandomForest']:
+            try:
+                model = load_model(file, verbose=False)
+                if model:
+                    # Use filename without extension as key
+                    model_key = os.path.splitext(file)[0]
+                    loaded_models[f'rf_{model_key}'] = model
+                    print(f"   ✅ Loaded: {file}")
+            except Exception as e:
+                print(f"   ❌ Failed to load {file}: {e}")
+    
+    # Load KNN models
+    if model_files['KNN']:
+        print(f"\n📦 Loading KNN models...")
+        for file in model_files['KNN']:
+            try:
+                model = load_model(file, verbose=False)
+                if model:
+                    model_key = os.path.splitext(file)[0]
+                    loaded_models[f'knn_{model_key}'] = model
+                    print(f"   ✅ Loaded: {file}")
+            except Exception as e:
+                print(f"   ❌ Failed to load {file}: {e}")
+    
+    # Load SVM models
+    if model_files['SVM']:
+        print(f"\n📦 Loading SVM models...")
+        for file in model_files['SVM']:
+            try:
+                model = load_model(file, verbose=False)
+                if model:
+                    model_key = os.path.splitext(file)[0]
+                    loaded_models[f'svm_{model_key}'] = model
+                    print(f"   ✅ Loaded: {file}")
+            except Exception as e:
+                print(f"   ❌ Failed to load {file}: {e}")
+    
+    # Load XGBoost models
+    if model_files['XGBoost']:
+        print(f"\n📦 Loading XGBoost models...")
+        for file in model_files['XGBoost']:
+            try:
+                model = load_model(file, verbose=False)
+                if model:
+                    model_key = os.path.splitext(file)[0]
+                    loaded_models[f'xgb_{model_key}'] = model
+                    print(f"   ✅ Loaded: {file}")
+            except Exception as e:
+                print(f"   ❌ Failed to load {file}: {e}")
+    
+    # Load CNN models
+    if model_files['CNN']:
+        print(f"\n� Loading CNN models...")
+        for file in model_files['CNN']:
+            try:
+                model = load_model(file, verbose=False)
+                if model:
+                    model_key = os.path.splitext(file)[0]
+                    loaded_models[f'cnn_{model_key}'] = model
+                    print(f"   ✅ Loaded: {file}")
+            except Exception as e:
+                print(f"   ❌ Failed to load {file}: {e}")
+    
+    # Load other models
+    if model_files['Other']:
+        print(f"\n📦 Loading other models...")
+        for file in model_files['Other']:
+            try:
+                model = load_model(file, verbose=False)
+                if model:
+                    model_key = os.path.splitext(file)[0]
+                    loaded_models[f'other_{model_key}'] = model
+                    print(f"   ✅ Loaded: {file}")
+            except Exception as e:
+                print(f"   ❌ Failed to load {file}: {e}")
+    
+    print("\n" + "="*70)
+    print(f"📊 AUTO-LOAD SUMMARY:")
+    print(f"   ✅ Successfully loaded: {len(loaded_models)} model(s)")
+    
+    if loaded_models:
+        print(f"\n✅ Loaded models:")
+        for model_name in loaded_models.keys():
+            print(f"   • {model_name}")
+    else:
+        print(f"   ⚠️ No models were loaded")
+    
+    print("="*70)
+    
+    return loaded_models
+
 # Example: Auto-load if default model exists
-if 'rf_model_full_trained.joblib' in saved_models:
-    print("\n💡 Quick Tip: Load your trained model with:")
-    print("   rf_model_full = quick_load()")
+saved_models = list_saved_models(verbose=False)
+if saved_models['RandomForest'] or saved_models['KNN'] or saved_models['SVM'] or saved_models['XGBoost']:
+    print("\n💡 Quick Tip: Auto-load all models with:")
+    print("   loaded_models = auto_load_all_models()")
 
 
 # This is the most important part!
 if __name__ == "__main__":
 
-    # Load all available models
+    # Auto-detect and load all saved models
     print("\n🤖 Loading Models...")
     print("="*70)
     
-    # Try to load saved Random Forest model
-    list_saved_models()
-    rf_model_full = load_model('rf_model_full_trained.joblib')
+    # List all available model files
+    list_saved_models(verbose=True)
     
-    # Create instances of other models (untrained, ready to train with full potential)
-    print("\n🔧 Creating full-featured model instances...")
-    knn_model = KNNAudioClassifier(n_neighbors=5, weights='distance', algorithm='auto')
-    svm_model = SVMAudioClassifier(kernel='rbf', C=1.0, gamma='scale')
-    xgboost_model = XGBoostAudioClassifier(n_estimators=100, max_depth=6, learning_rate=0.1)
+    # Auto-load all saved models
+    loaded_models_dict = auto_load_all_models()
     
-    print("✅ KNN model instance created (full-featured, n_neighbors=5)")
-    print("✅ SVM model instance created (full-featured, kernel=rbf)")
-    print("✅ XGBoost model instance created (full-featured, n_estimators=100)")
+    # Extract specific models if they exist
+    rf_model_full = None
+    knn_model = None
+    svm_model = None
+    xgboost_model = None
+    
+    # Try to get the first model of each type from loaded models
+    for key, model in loaded_models_dict.items():
+        if key.startswith('rf_') and rf_model_full is None:
+            rf_model_full = model
+            print(f"\n✅ Using Random Forest: {key}")
+        elif key.startswith('knn_') and knn_model is None:
+            knn_model = model
+            print(f"✅ Using KNN: {key}")
+        elif key.startswith('svm_') and svm_model is None:
+            svm_model = model
+            print(f"✅ Using SVM: {key}")
+        elif key.startswith('xgb_') and xgboost_model is None:
+            xgboost_model = model
+            print(f"✅ Using XGBoost: {key}")
+    
+    # Create new instances for models that weren't found
+    print("\n🔧 Creating model instances for models not found on disk...")
+    if rf_model_full is None:
+        rf_model_full = RandomForestFullFeatures(n_estimators=100, max_depth=None, min_samples_split=2, random_state=42)
+        print("✅ Random Forest instance created (untrained)")
+    
+    if knn_model is None:
+        knn_model = KNNAudioClassifier(n_neighbors=15, weights='uniform', algorithm='auto')
+        print("✅ KNN instance created (untrained, n_neighbors=15)")
+    
+    if svm_model is None:
+        svm_model = SVMAudioClassifier(kernel='rbf', C=1.0, gamma='scale', max_iter=-1)
+        print("✅ SVM instance created (untrained, kernel=rbf)")
+    
+    if xgboost_model is None:
+        xgboost_model = XGBoostAudioClassifier(n_estimators=100, max_depth=6, learning_rate=0.1, verbosity=2)
+        print("✅ XGBoost instance created (untrained, n_estimators=100)")
     
     print("\n🚀 Quick Loading Augmented 5000 Dataset...")
 
