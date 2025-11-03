@@ -3,6 +3,8 @@
 
 # 2. But, DO NOT ignore the file you want
 !/AudioClassification.ipynb
+!/main.py
+!/gui.py
 
 # 3. (Optional but recommended) DO NOT ignore this .gitignore file itself
 !/.gitignore
