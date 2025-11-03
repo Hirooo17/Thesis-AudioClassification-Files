@@ -1,0 +1,8 @@
+# 1. Ignore ALL files and folders
+**/*
+
+# 2. But, DO NOT ignore the file you want
+!/AudioClassification.ipynb
+
+# 3. (Optional but recommended) DO NOT ignore this .gitignore file itself
+!/.gitignore
