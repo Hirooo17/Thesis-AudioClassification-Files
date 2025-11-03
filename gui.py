@@ -381,6 +381,71 @@ class AdvancedSimulationAudioGUI:
                                     values=list(self.available_datasets.keys()) if hasattr(self, 'available_datasets') else [],
                                     state='readonly', width=40, font=('Arial', 12))
         dataset_combo.pack(fill='x', pady=5)
+        dataset_combo.bind('<<ComboboxSelected>>', self.on_dataset_changed)
+        
+        # Feature type indicator
+        self.feature_type_frame = tk.Frame(dataset_frame, bg='#2c3e50', relief='raised', bd=2)
+        self.feature_type_frame.pack(fill='x', pady=10)
+        
+        self.feature_type_label = tk.Label(self.feature_type_frame, 
+                                          text="📊 Feature Type: Select a dataset", 
+                                          font=('Arial', 12, 'bold'), 
+                                          bg='#2c3e50', fg='#ecf0f1',
+                                          padx=10, pady=5)
+        self.feature_type_label.pack()
+        
+        # Update feature type on initial load
+        self.update_feature_type_display()
+        
+        # Add helpful info panel
+        info_frame = tk.LabelFrame(selection_frame, text="ℹ️ Dataset Feature Types", 
+                                  font=('Arial', 12, 'bold'),
+                                  bg='#34495e', fg='white', padx=15, pady=10)
+        info_frame.pack(fill='x', pady=10)
+        
+        info_text = """
+🎵 MFCC Datasets (Recommended for Tree Models):
+   • 40 features per sample (vs 16,384 for spectrogram)
+   • 400x faster training time
+   • Lower memory usage (~2 MB vs ~800 MB)
+   • Ideal for: Random Forest, XGBoost, KNN, SVM
+   
+📈 Spectrogram Datasets (High Detail):
+   • 128x128 = 16,384 features per sample
+   • More detailed frequency information
+   • Longer training time
+   • Ideal for: CNN, Deep Learning models
+        """
+        
+        info_label = tk.Label(info_frame, text=info_text, 
+                            font=('Consolas', 9), 
+                            bg='#34495e', fg='#ecf0f1',
+                            justify='left', anchor='w')
+        info_label.pack(fill='x')
+        
+    def on_dataset_changed(self, event=None):
+        """Called when dataset selection changes"""
+        self.update_feature_type_display()
+        
+    def update_feature_type_display(self):
+        """Update the feature type indicator based on selected dataset"""
+        selected = self.selected_dataset.get()
+        
+        if selected and selected != 'none':
+            if 'mfcc_' in selected:
+                feature_text = "🎵 Feature Type: MFCC (40 coefficients) - Fast Training!"
+                bg_color = '#27ae60'  # Green
+            else:
+                feature_text = "📈 Feature Type: Spectrogram (128x128) - High Detail"
+                bg_color = '#3498db'  # Blue
+            
+            self.feature_type_label.config(text=feature_text)
+            self.feature_type_frame.config(bg=bg_color)
+            self.feature_type_label.config(bg=bg_color)
+        else:
+            self.feature_type_label.config(text="📊 Feature Type: Select a dataset")
+            self.feature_type_frame.config(bg='#2c3e50')
+            self.feature_type_label.config(bg='#2c3e50')
         
     def create_enhanced_operation_controls(self):
         """Create enhanced operation controls"""
@@ -609,7 +674,10 @@ class AdvancedSimulationAudioGUI:
     def update_current_sample(self, sample_num, total_samples, dataset_info=None):
         """Update current sample display with detailed information"""
         if dataset_info:
-            text = f"🎵 Analyzing Sample #{sample_num:04d} of {total_samples} | Dataset: {dataset_info}"
+            # Determine feature type
+            feature_icon = "🎵" if "mfcc_" in dataset_info.lower() else "📈"
+            feature_type = "MFCC" if "mfcc_" in dataset_info.lower() else "Spectrogram"
+            text = f"{feature_icon} Sample #{sample_num:04d}/{total_samples} | {feature_type} | Dataset: {dataset_info}"
         else:
             text = f"🎵 Analyzing Sample #{sample_num:04d} of {total_samples}"
         self.current_sample_display.config(text=text)
@@ -1416,19 +1484,55 @@ Final Accuracy: {accuracy:.2f}%
 
         # 2. Add all loaded datasets
         if self.datasets:
+            # Separate MFCC and spectrogram datasets for better organization
+            mfcc_datasets = {}
+            spectrogram_datasets = {}
+            
             for key, data in self.datasets.items():
                 if data['train'] is not None:
-                    # 'key' will be 'snr_5' or 'safe_5000'
-                    # 'display_name' will be 'SNR 5dB'
-                    display_name = data.get('info', {}).get('dataset_name', key)
-                    # We add all three splits
-                    self.available_datasets[f'{key}_train'] = f"{display_name} (Train)"
-                    self.available_datasets[f'{key}_val'] = f"{display_name} (Validation)"
-                    self.available_datasets[f'{key}_test'] = f"{display_name} (Test)"
+                    # Determine if it's MFCC or spectrogram based
+                    is_mfcc = key.startswith('mfcc_')
+                    
+                    # Get display name
+                    if is_mfcc:
+                        # Remove 'mfcc_' prefix for display
+                        base_name = key.replace('mfcc_', '', 1)
+                        display_name = f"🎵 MFCC - {base_name}"
+                    else:
+                        display_name = data.get('info', {}).get('dataset_name', key)
+                        if 'snr_' in key:
+                            display_name = f"📈 Spectrogram - {display_name}"
+                        else:
+                            display_name = f"📈 {display_name}"
+                    
+                    # Add all three splits with feature type indicator
+                    feature_type = "MFCC" if is_mfcc else "Spectrogram"
+                    dataset_dict = mfcc_datasets if is_mfcc else spectrogram_datasets
+                    
+                    dataset_dict[f'{key}_train'] = f"{display_name} (Train)"
+                    dataset_dict[f'{key}_val'] = f"{display_name} (Validation)"
+                    dataset_dict[f'{key}_test'] = f"{display_name} (Test)"
+            
+            # Add spectrogram datasets first, then MFCC datasets
+            self.available_datasets.update(spectrogram_datasets)
+            self.available_datasets.update(mfcc_datasets)
 
-            # Set a default dataset
-            if 'snr_5_test' in self.available_datasets:
-                 self.selected_dataset.set('snr_5_test')
+            # Set a default dataset - prefer MFCC for faster training
+            default_ds = None
+            if mfcc_datasets:
+                # Try to use MFCC train_test_val test set first
+                if 'mfcc_train_test_val_test' in self.available_datasets:
+                    default_ds = 'mfcc_train_test_val_test'
+                else:
+                    default_ds = list(mfcc_datasets.keys())[0]
+            elif spectrogram_datasets:
+                if 'snr_5_test' in self.available_datasets:
+                    default_ds = 'snr_5_test'
+                else:
+                    default_ds = list(spectrogram_datasets.keys())[0]
+            
+            if default_ds:
+                self.selected_dataset.set(default_ds)
         else:
             self.available_datasets['none'] = "No Datasets Loaded"
             self.selected_dataset.set('none')
