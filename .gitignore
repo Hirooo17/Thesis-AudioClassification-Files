@@ -10,6 +10,7 @@
 # 3. IMPORTANT: Un-ignore the 'Models' directory
 # This allows Git to look inside this folder
 !/Models
+!/Utilities
 
 # 4. Now, un-ignore the specific files *inside* the Models directory
 !/Models/KNN.py
@@ -17,6 +18,7 @@
 !/Models/CNN.py
 !/Models/RandomForest.py
 !/Models/XGBoost.py
+!/Utilities/hardware_computation.py
 
 # 5. (Optional but recommended) DO NOT ignore this .gitignore file itself
 !/.gitignore

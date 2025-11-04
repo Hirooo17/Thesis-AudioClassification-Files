@@ -9,6 +9,9 @@ import queue
 import time
 import random
 import joblib
+import sys
+import os
+import psutil
 
 class AdvancedSimulationAudioGUI:
     def __init__(self, root, loaded_models, loaded_datasets):
@@ -108,24 +111,45 @@ class AdvancedSimulationAudioGUI:
         self.create_enhanced_simulation_settings()
         
     def create_live_prediction_tab(self):
-        """Create live prediction feedback tab"""
+        """Create live prediction feedback tab with SCROLLABLE container"""
         pred_frame = tk.Frame(self.main_notebook, bg='#1a1a1a')
         self.main_notebook.add(pred_frame, text="🔮 Live Predictions")
         
+        # Create SCROLLABLE container
+        pred_canvas = tk.Canvas(pred_frame, bg='#1a1a1a', highlightthickness=0)
+        pred_scrollbar = ttk.Scrollbar(pred_frame, orient="vertical", command=pred_canvas.yview)
+        self.pred_content = tk.Frame(pred_canvas, bg='#1a1a1a')
+        
+        self.pred_content.bind(
+            "<Configure>",
+            lambda e: pred_canvas.configure(scrollregion=pred_canvas.bbox("all"))
+        )
+        
+        pred_canvas.create_window((0, 0), window=self.pred_content, anchor="nw")
+        pred_canvas.configure(yscrollcommand=pred_scrollbar.set)
+        
+        pred_canvas.pack(side="left", fill="both", expand=True)
+        pred_scrollbar.pack(side="right", fill="y")
+        
+        # Enable mouse wheel scrolling
+        def _on_pred_mousewheel(event):
+            pred_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        pred_canvas.bind_all("<MouseWheel>", _on_pred_mousewheel)
+        
         # Header with animated status
-        self.create_animated_header(pred_frame)
+        self.create_animated_header(self.pred_content)
         
         # Live prediction display
-        self.create_live_prediction_display(pred_frame)
+        self.create_live_prediction_display(self.pred_content)
         
         # Progress and statistics
-        self.create_enhanced_progress_section(pred_frame)
+        self.create_enhanced_progress_section(self.pred_content)
         
         # Recent predictions feed
-        self.create_prediction_feed(pred_frame)
+        self.create_prediction_feed(self.pred_content)
         
         # Live visualization
-        self.create_enhanced_live_visualization(pred_frame)
+        self.create_enhanced_live_visualization(self.pred_content)
         
     def create_animated_header(self, parent):
         """Create animated header with pulsing effects"""
@@ -293,24 +317,24 @@ class AdvancedSimulationAudioGUI:
                                                          fill='#00d4ff', tags='circle_text')
         
     def create_prediction_feed(self, parent):
-        """Create live prediction feed with ENHANCED SIZE and LARGER FONT"""
+        """Create live prediction feed with LARGER SQUARE-SHAPED LOG AREA"""
         feed_frame = tk.LabelFrame(parent, text="📝 Live Prediction Feed", 
                                   font=('Arial', 18, 'bold'), bg='#2c3e50', fg='white',
                                   padx=20, pady=20)
         feed_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
-        # Feed display with dark theme and LARGER FONT
-        self.prediction_feed = scrolledtext.ScrolledText(feed_frame, height=15, width=100,
+        # SQUARE-SHAPED Feed display with MUCH LARGER FONT (35 lines x 85 width for square shape)
+        self.prediction_feed = scrolledtext.ScrolledText(feed_frame, height=35, width=85,
                                                         bg='#1a1a1a', fg='#ecf0f1',
-                                                        font=('Consolas', 13, 'bold'),  # INCREASED from 11 to 13
+                                                        font=('Consolas', 15, 'bold'),  # INCREASED from 13 to 15
                                                         wrap=tk.WORD, insertbackground='white')
         self.prediction_feed.pack(fill='both', expand=True, pady=10)
         
         # Configure text tags for color coding with LARGER FONT
-        self.prediction_feed.tag_configure("correct", foreground="#27ae60", font=('Consolas', 13, 'bold'))
-        self.prediction_feed.tag_configure("incorrect", foreground="#e74c3c", font=('Consolas', 13, 'bold'))
-        self.prediction_feed.tag_configure("info", foreground="#3498db", font=('Consolas', 13, 'bold'))
-        self.prediction_feed.tag_configure("warning", foreground="#f39c12", font=('Consolas', 13, 'bold'))
+        self.prediction_feed.tag_configure("correct", foreground="#27ae60", font=('Consolas', 15, 'bold'))
+        self.prediction_feed.tag_configure("incorrect", foreground="#e74c3c", font=('Consolas', 15, 'bold'))
+        self.prediction_feed.tag_configure("info", foreground="#3498db", font=('Consolas', 15, 'bold'))
+        self.prediction_feed.tag_configure("warning", foreground="#f39c12", font=('Consolas', 15, 'bold'))
         
         # Add initial message
         self.add_prediction_log("🚀 Live Prediction Feed Initialized", "info")
@@ -961,11 +985,11 @@ Final Accuracy: {accuracy:.2f}%
         self.add_prediction_log("📊 Ready for new prediction session!", "info")
     
     def create_training_tab(self):
-        """Create training tab for model training"""
+        """Create training tab for model training with SCROLLABLE area"""
         train_frame = tk.Frame(self.main_notebook, bg='#2c3e50')
         self.main_notebook.add(train_frame, text="🎓 Model Training")
         
-        # Header
+        # Header (fixed at top)
         header = tk.Frame(train_frame, bg='#0f3460', height=80, relief='raised', bd=3)
         header.pack(fill='x', padx=10, pady=10)
         header.pack_propagate(False)
@@ -976,8 +1000,32 @@ Final Accuracy: {accuracy:.2f}%
                                        font=('Arial', 14, 'bold'), fg='#f39c12', bg='#0f3460')
         self.training_status.pack()
         
-        # Training configuration
-        config_frame = tk.LabelFrame(train_frame, text="⚙️ Training Configuration", 
+        # Create SCROLLABLE container for all training content
+        scroll_container = tk.Frame(train_frame, bg='#2c3e50')
+        scroll_container.pack(fill='both', expand=True)
+        
+        train_canvas = tk.Canvas(scroll_container, bg='#2c3e50', highlightthickness=0)
+        train_scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=train_canvas.yview)
+        self.training_content = tk.Frame(train_canvas, bg='#2c3e50')
+        
+        self.training_content.bind(
+            "<Configure>",
+            lambda e: train_canvas.configure(scrollregion=train_canvas.bbox("all"))
+        )
+        
+        train_canvas.create_window((0, 0), window=self.training_content, anchor="nw")
+        train_canvas.configure(yscrollcommand=train_scrollbar.set)
+        
+        train_canvas.pack(side="left", fill="both", expand=True)
+        train_scrollbar.pack(side="right", fill="y")
+        
+        # Enable mouse wheel scrolling
+        def _on_mousewheel(event):
+            train_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        train_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # Training configuration (now inside scrollable area)
+        config_frame = tk.LabelFrame(self.training_content, text="⚙️ Training Configuration", 
                                     font=('Arial', 16, 'bold'), bg='#34495e', fg='white',
                                     padx=20, pady=20)
         config_frame.pack(fill='x', padx=10, pady=10)
@@ -1021,27 +1069,174 @@ Final Accuracy: {accuracy:.2f}%
                                 state='readonly', width=40, font=('Arial', 12))
         val_combo.pack(fill='x', pady=5)
         
-        # Model parameters
-        params_frame = tk.Frame(config_frame, bg='#34495e')
-        params_frame.pack(fill='x', pady=10)
+        # ==================== HYPERPARAMETER CONFIGURATION ====================
+        # Create container for all model-specific parameters
+        hyperparams_container = tk.LabelFrame(config_frame, text="🎛️ Hyperparameter Tuning (Anti-Overfitting)", 
+                                             font=('Arial', 14, 'bold'), bg='#2c3e50', fg='#00d4ff',
+                                             padx=15, pady=15, relief='raised', bd=3)
+        hyperparams_container.pack(fill='x', pady=15)
+        
+        # Add info label
+        info_label = tk.Label(hyperparams_container, 
+                             text="⚠️ Adjust these parameters to reduce overfitting. Lower values = Less overfitting!", 
+                             font=('Arial', 11, 'bold'), bg='#2c3e50', fg='#f39c12', wraplength=700)
+        info_label.pack(pady=5)
+        
+        # ========== RANDOM FOREST PARAMETERS ==========
+        rf_frame = tk.LabelFrame(hyperparams_container, text="🌳 Random Forest Parameters", 
+                                font=('Arial', 12, 'bold'), bg='#34495e', fg='white',
+                                padx=15, pady=10)
+        rf_frame.pack(fill='x', pady=10)
         
         # N_estimators
-        tk.Label(params_frame, text="🌲 Number of Trees (n_estimators):", 
-                font=('Arial', 12, 'bold'), bg='#34495e', fg='white').grid(row=0, column=0, sticky='w', pady=5)
-        self.n_estimators_var = tk.StringVar(value="100")
-        n_est_combo = ttk.Combobox(params_frame, textvariable=self.n_estimators_var,
-                                   values=["50", "100", "200", "300", "500"],
-                                   width=15, font=('Arial', 11))
-        n_est_combo.grid(row=0, column=1, padx=10, pady=5)
+        rf_row1 = tk.Frame(rf_frame, bg='#34495e')
+        rf_row1.pack(fill='x', pady=5)
+        tk.Label(rf_row1, text="🌲 Number of Trees:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='white', width=25, anchor='w').pack(side='left')
+        self.rf_n_estimators_var = tk.StringVar(value="100")
+        ttk.Combobox(rf_row1, textvariable=self.rf_n_estimators_var,
+                    values=["50", "100", "150", "200", "300"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(rf_row1, text="More trees = Better but slower", 
+                font=('Arial', 9), bg='#34495e', fg='#95a5a6').pack(side='left', padx=5)
+        
+        # Max depth (CRITICAL for overfitting!)
+        rf_row2 = tk.Frame(rf_frame, bg='#34495e')
+        rf_row2.pack(fill='x', pady=5)
+        tk.Label(rf_row2, text="📏 Max Depth:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.rf_max_depth_var = tk.StringVar(value="10")
+        ttk.Combobox(rf_row2, textvariable=self.rf_max_depth_var,
+                    values=["5", "8", "10", "15", "20", "None"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(rf_row2, text="⚠️ LOWER = Less overfitting! Try 5-10", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#e74c3c').pack(side='left', padx=5)
+        
+        # Min samples split (CRITICAL!)
+        rf_row3 = tk.Frame(rf_frame, bg='#34495e')
+        rf_row3.pack(fill='x', pady=5)
+        tk.Label(rf_row3, text="🔀 Min Samples Split:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.rf_min_samples_split_var = tk.StringVar(value="20")
+        ttk.Combobox(rf_row3, textvariable=self.rf_min_samples_split_var,
+                    values=["2", "10", "20", "50", "100"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(rf_row3, text="⚠️ HIGHER = Less overfitting! Try 20-50", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#e74c3c').pack(side='left', padx=5)
+        
+        # Min samples leaf (CRITICAL!)
+        rf_row4 = tk.Frame(rf_frame, bg='#34495e')
+        rf_row4.pack(fill='x', pady=5)
+        tk.Label(rf_row4, text="🍃 Min Samples Leaf:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.rf_min_samples_leaf_var = tk.StringVar(value="10")
+        ttk.Combobox(rf_row4, textvariable=self.rf_min_samples_leaf_var,
+                    values=["1", "5", "10", "25", "50"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(rf_row4, text="⚠️ HIGHER = Less overfitting! Try 10-25", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#e74c3c').pack(side='left', padx=5)
+        
+        # ========== KNN PARAMETERS ==========
+        knn_frame = tk.LabelFrame(hyperparams_container, text="� KNN Parameters", 
+                                 font=('Arial', 12, 'bold'), bg='#34495e', fg='white',
+                                 padx=15, pady=10)
+        knn_frame.pack(fill='x', pady=10)
+        
+        # N neighbors
+        knn_row1 = tk.Frame(knn_frame, bg='#34495e')
+        knn_row1.pack(fill='x', pady=5)
+        tk.Label(knn_row1, text="👥 Number of Neighbors:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.knn_n_neighbors_var = tk.StringVar(value="15")
+        ttk.Combobox(knn_row1, textvariable=self.knn_n_neighbors_var,
+                    values=["5", "10", "15", "20", "25", "30"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(knn_row1, text="⚠️ HIGHER = Less overfitting! Try 15-25", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#e74c3c').pack(side='left', padx=5)
+        
+        # Weights
+        knn_row2 = tk.Frame(knn_frame, bg='#34495e')
+        knn_row2.pack(fill='x', pady=5)
+        tk.Label(knn_row2, text="⚖️ Weights:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='white', width=25, anchor='w').pack(side='left')
+        self.knn_weights_var = tk.StringVar(value="uniform")
+        ttk.Combobox(knn_row2, textvariable=self.knn_weights_var,
+                    values=["uniform", "distance"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(knn_row2, text="uniform = Less overfitting", 
+                font=('Arial', 9), bg='#34495e', fg='#95a5a6').pack(side='left', padx=5)
+        
+        # ========== SVM PARAMETERS ==========
+        svm_frame = tk.LabelFrame(hyperparams_container, text="🎯 SVM Parameters", 
+                                 font=('Arial', 12, 'bold'), bg='#34495e', fg='white',
+                                 padx=15, pady=10)
+        svm_frame.pack(fill='x', pady=10)
+        
+        # Kernel
+        svm_row1 = tk.Frame(svm_frame, bg='#34495e')
+        svm_row1.pack(fill='x', pady=5)
+        tk.Label(svm_row1, text="🔮 Kernel:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='white', width=25, anchor='w').pack(side='left')
+        self.svm_kernel_var = tk.StringVar(value="linear")  # Changed to linear for less overfitting
+        ttk.Combobox(svm_row1, textvariable=self.svm_kernel_var,
+                    values=["linear", "rbf", "poly"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(svm_row1, text="✅ linear = BEST for small datasets!", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#2ecc71').pack(side='left', padx=5)
+        
+        # C (Regularization)
+        svm_row2 = tk.Frame(svm_frame, bg='#34495e')
+        svm_row2.pack(fill='x', pady=5)
+        tk.Label(svm_row2, text="⚖️ Regularization (C):", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.svm_C_var = tk.StringVar(value="0.1")  # Changed to 0.1 for strong regularization
+        ttk.Combobox(svm_row2, textvariable=self.svm_C_var,
+                    values=["0.01", "0.05", "0.1", "0.5", "1.0", "5.0", "10.0"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(svm_row2, text="❗ DEFAULT: 0.1 (Strong regularization)", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#2ecc71').pack(side='left', padx=5)
+        
+        # ========== XGBOOST PARAMETERS ==========
+        xgb_frame = tk.LabelFrame(hyperparams_container, text="🚀 XGBoost Parameters", 
+                                 font=('Arial', 12, 'bold'), bg='#34495e', fg='white',
+                                 padx=15, pady=10)
+        xgb_frame.pack(fill='x', pady=10)
+        
+        # N estimators
+        xgb_row1 = tk.Frame(xgb_frame, bg='#34495e')
+        xgb_row1.pack(fill='x', pady=5)
+        tk.Label(xgb_row1, text="🌲 Number of Estimators:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='white', width=25, anchor='w').pack(side='left')
+        self.xgb_n_estimators_var = tk.StringVar(value="100")
+        ttk.Combobox(xgb_row1, textvariable=self.xgb_n_estimators_var,
+                    values=["50", "100", "150", "200"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(xgb_row1, text="More = Better but slower", 
+                font=('Arial', 9), bg='#34495e', fg='#95a5a6').pack(side='left', padx=5)
         
         # Max depth
-        tk.Label(params_frame, text="📏 Max Depth:", 
-                font=('Arial', 12, 'bold'), bg='#34495e', fg='white').grid(row=1, column=0, sticky='w', pady=5)
-        self.max_depth_var = tk.StringVar(value="None")
-        depth_combo = ttk.Combobox(params_frame, textvariable=self.max_depth_var,
-                                   values=["None", "10", "20", "30", "50"],
-                                   width=15, font=('Arial', 11))
-        depth_combo.grid(row=1, column=1, padx=10, pady=5)
+        xgb_row2 = tk.Frame(xgb_frame, bg='#34495e')
+        xgb_row2.pack(fill='x', pady=5)
+        tk.Label(xgb_row2, text="📏 Max Depth:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.xgb_max_depth_var = tk.StringVar(value="6")
+        ttk.Combobox(xgb_row2, textvariable=self.xgb_max_depth_var,
+                    values=["3", "4", "5", "6", "8", "10"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(xgb_row2, text="⚠️ LOWER = Less overfitting! Try 3-6", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#e74c3c').pack(side='left', padx=5)
+        
+        # Learning rate
+        xgb_row3 = tk.Frame(xgb_frame, bg='#34495e')
+        xgb_row3.pack(fill='x', pady=5)
+        tk.Label(xgb_row3, text="📈 Learning Rate:", 
+                font=('Arial', 11, 'bold'), bg='#34495e', fg='#e74c3c', width=25, anchor='w').pack(side='left')
+        self.xgb_learning_rate_var = tk.StringVar(value="0.1")
+        ttk.Combobox(xgb_row3, textvariable=self.xgb_learning_rate_var,
+                    values=["0.01", "0.05", "0.1", "0.2", "0.3"],
+                    width=15, font=('Arial', 10)).pack(side='left', padx=5)
+        tk.Label(xgb_row3, text="⚠️ LOWER = Less overfitting! Try 0.01-0.1", 
+                font=('Arial', 9, 'bold'), bg='#34495e', fg='#e74c3c').pack(side='left', padx=5)
         
         # Training controls
         control_frame = tk.Frame(config_frame, bg='#34495e')
@@ -1060,8 +1255,8 @@ Final Accuracy: {accuracy:.2f}%
                                         state='disabled')
         self.save_model_btn.pack(side='left', padx=10)
         
-        # Training progress
-        progress_frame = tk.LabelFrame(train_frame, text="📊 Training Progress", 
+        # Training progress (now in scrollable area)
+        progress_frame = tk.LabelFrame(self.training_content, text="📊 Training Progress", 
                                       font=('Arial', 16, 'bold'), bg='#34495e', fg='white',
                                       padx=20, pady=20)
         progress_frame.pack(fill='x', padx=10, pady=10)
@@ -1074,23 +1269,24 @@ Final Accuracy: {accuracy:.2f}%
                                                      style="Custom.Horizontal.TProgressbar")
         self.training_progress_bar.pack(fill='x', pady=10)
         
-        # Training log with ENHANCED SIZE and LARGER FONT
-        log_frame = tk.LabelFrame(train_frame, text="📝 Training Log", 
+        # Training log with LARGER SQUARE-SHAPED AREA (now in scrollable area)
+        log_frame = tk.LabelFrame(self.training_content, text="📝 Training Log", 
                                  font=('Arial', 18, 'bold'), bg='#34495e', fg='white',
                                  padx=20, pady=20)
         log_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
-        self.training_log = scrolledtext.ScrolledText(log_frame, height=18, width=100,
+        # SQUARE-SHAPED log display (30 lines x 85 width for square shape)
+        self.training_log = scrolledtext.ScrolledText(log_frame, height=30, width=85,
                                                       bg='#1a1a1a', fg='#ecf0f1',
-                                                      font=('Consolas', 12, 'bold'),  # INCREASED from 10 to 12
+                                                      font=('Consolas', 15, 'bold'),  # INCREASED from 12 to 15
                                                       wrap=tk.WORD, insertbackground='white')
         self.training_log.pack(fill='both', expand=True, pady=10)
         
         # Configure text tags with LARGER FONT
-        self.training_log.tag_configure("success", foreground="#27ae60", font=('Consolas', 12, 'bold'))
-        self.training_log.tag_configure("error", foreground="#e74c3c", font=('Consolas', 12, 'bold'))
-        self.training_log.tag_configure("info", foreground="#3498db", font=('Consolas', 12, 'bold'))
-        self.training_log.tag_configure("warning", foreground="#f39c12", font=('Consolas', 12, 'bold'))
+        self.training_log.tag_configure("success", foreground="#27ae60", font=('Consolas', 15, 'bold'))
+        self.training_log.tag_configure("error", foreground="#e74c3c", font=('Consolas', 15, 'bold'))
+        self.training_log.tag_configure("info", foreground="#3498db", font=('Consolas', 15, 'bold'))
+        self.training_log.tag_configure("warning", foreground="#f39c12", font=('Consolas', 15, 'bold'))
         
         self.add_training_log("🎓 Training Center Initialized", "info")
         self.add_training_log("📊 Configure parameters and click 'START TRAINING' to begin", "info")
@@ -1154,40 +1350,98 @@ Final Accuracy: {accuracy:.2f}%
             self.root.after(0, lambda: self.add_training_log(f"✅ Training dataset: {train_dataset_name}", "success"))
             self.root.after(0, lambda: self.add_training_log(f"✅ Validation dataset: {val_dataset_name}", "success"))
             
+            # Detect and display feature type
+            is_mfcc = train_dataset_name.startswith('mfcc_')
+            feature_type = "MFCC (40 features)" if is_mfcc else "SPECTROGRAM (~16k features)"
+            self.root.after(0, lambda ft=feature_type: self.add_training_log(f"🔍 Feature Type: {ft}", "info"))
+            self.root.after(0, lambda: self.add_training_log(f"💡 Remember: Use same feature type for prediction!", "warning"))
+            
             # Start progress bar
             self.root.after(0, lambda: self.training_progress_bar.start(10))
-            
-            # Get model parameters
-            n_estimators = int(self.n_estimators_var.get())
-            max_depth_str = self.max_depth_var.get()
-            max_depth = None if max_depth_str == "None" else int(max_depth_str)
             
             # Get selected model type
             model_type = self.train_model_type.get()
             
-            # Create model based on type
+            # Create model based on type with CONFIGURED HYPERPARAMETERS
             if model_type == 'RandomForest':
-                self.root.after(0, lambda: self.add_training_log(f"🌲 Creating Random Forest (n_estimators={n_estimators}, max_depth={max_depth})", "info"))
+                # Get Random Forest hyperparameters
+                rf_n_est = int(self.rf_n_estimators_var.get())
+                rf_max_depth_str = self.rf_max_depth_var.get()
+                rf_max_depth = None if rf_max_depth_str == "None" else int(rf_max_depth_str)
+                rf_min_split = int(self.rf_min_samples_split_var.get())
+                rf_min_leaf = int(self.rf_min_samples_leaf_var.get())
+                
+                self.root.after(0, lambda: self.add_training_log(f"🌲 Creating Random Forest with Anti-Overfitting Settings:", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • n_estimators={rf_n_est}", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • max_depth={rf_max_depth}", "warning"))
+                self.root.after(0, lambda: self.add_training_log(f"   • min_samples_split={rf_min_split}", "warning"))
+                self.root.after(0, lambda: self.add_training_log(f"   • min_samples_leaf={rf_min_leaf}", "warning"))
+                
                 from Models.RandomForrest import RandomForestFullFeatures
                 model = RandomForestFullFeatures(
-                    n_estimators=n_estimators,
-                    max_depth=max_depth,
+                    n_estimators=rf_n_est,
+                    max_depth=rf_max_depth,
+                    min_samples_split=rf_min_split,
+                    min_samples_leaf=rf_min_leaf,
                     random_state=42
                 )
             elif model_type == 'KNN':
-                self.root.after(0, lambda: self.add_training_log(f"🔍 Creating KNN Classifier (n_neighbors=5, full dataset)", "info"))
+                # Get KNN hyperparameters
+                knn_neighbors = int(self.knn_n_neighbors_var.get())
+                knn_weights = self.knn_weights_var.get()
+                
+                self.root.after(0, lambda: self.add_training_log(f"🔍 Creating KNN with Anti-Overfitting Settings:", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • n_neighbors={knn_neighbors}", "warning"))
+                self.root.after(0, lambda: self.add_training_log(f"   • weights={knn_weights}", "info"))
+                
                 from Models.KNN import KNNAudioClassifier
-                model = KNNAudioClassifier(n_neighbors=5, weights='distance', algorithm='auto')
+                model = KNNAudioClassifier(
+                    n_neighbors=knn_neighbors, 
+                    weights=knn_weights, 
+                    algorithm='auto'
+                )
             elif model_type == 'SVM':
-                self.root.after(0, lambda: self.add_training_log(f"⚡ Creating SVM Classifier (kernel=rbf, C=1.0, full dataset)", "info"))
+                # Get SVM hyperparameters
+                svm_kernel = self.svm_kernel_var.get()
+                svm_C = float(self.svm_C_var.get())
+                
+                self.root.after(0, lambda: self.add_training_log(f"⚡ Creating SVM with Anti-Overfitting Settings:", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • kernel={svm_kernel}", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • C={svm_C}", "warning"))
+                self.root.after(0, lambda: self.add_training_log(f"   • class_weight=balanced (auto)", "info"))
+                
+                # Warn about overfitting risk
+                if svm_C >= 1.0 or svm_kernel != 'linear':
+                    self.root.after(0, lambda: self.add_training_log(f"⚠️  WARNING: High overfitting risk detected!", "error"))
+                    if svm_C >= 1.0:
+                        self.root.after(0, lambda: self.add_training_log(f"   • C={svm_C} is high - try C=0.1 for better generalization", "error"))
+                    if svm_kernel != 'linear':
+                        self.root.after(0, lambda: self.add_training_log(f"   • {svm_kernel} kernel is complex - try 'linear' for small datasets", "error"))
+                else:
+                    self.root.after(0, lambda: self.add_training_log(f"✅ Good anti-overfitting configuration!", "success"))
+                
                 from Models.SVM import SVMAudioClassifier
-                model = SVMAudioClassifier(kernel='rbf', C=1.0, gamma='scale')
+                model = SVMAudioClassifier(
+                    kernel=svm_kernel, 
+                    C=svm_C, 
+                    gamma='scale'
+                )
             elif model_type == 'XGBoost':
-                self.root.after(0, lambda: self.add_training_log(f"🚀 Creating XGBoost Classifier (n_estimators={n_estimators}, max_depth={max_depth})", "info"))
+                # Get XGBoost hyperparameters
+                xgb_n_est = int(self.xgb_n_estimators_var.get())
+                xgb_max_depth = int(self.xgb_max_depth_var.get())
+                xgb_lr = float(self.xgb_learning_rate_var.get())
+                
+                self.root.after(0, lambda: self.add_training_log(f"🚀 Creating XGBoost with Anti-Overfitting Settings:", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • n_estimators={xgb_n_est}", "info"))
+                self.root.after(0, lambda: self.add_training_log(f"   • max_depth={xgb_max_depth}", "warning"))
+                self.root.after(0, lambda: self.add_training_log(f"   • learning_rate={xgb_lr}", "warning"))
+                
                 from Models.XgBoost import XGBoostAudioClassifier
                 model = XGBoostAudioClassifier(
-                    n_estimators=n_estimators,
-                    max_depth=max_depth if max_depth else 6
+                    n_estimators=xgb_n_est,
+                    max_depth=xgb_max_depth,
+                    learning_rate=xgb_lr
                 )
             else:
                 self.root.after(0, lambda: self.add_training_log(f"❌ Unknown model type: {model_type}", "error"))
@@ -1203,8 +1457,29 @@ Final Accuracy: {accuracy:.2f}%
             self.root.after(0, lambda: self.add_training_log("🎓 Starting training process...", "info"))
             self.root.after(0, lambda: self.training_progress_label.config(text="Training model... This may take several minutes..."))
             
+            # Initialize resource monitoring
+            process = psutil.Process(os.getpid())
+            start_time = time.time()
+            start_memory = process.memory_info().rss / (1024 * 1024)  # MB
+            
+            self.root.after(0, lambda: self.add_training_log("📊 Resource Monitoring Started", "info"))
+            self.root.after(0, lambda: self.add_training_log(f"   • Initial Memory: {start_memory:.2f} MB", "info"))
+            
             # Train the model
             history = model.fit(train_dataset, validation_data=val_dataset)
+            
+            # Calculate resource usage
+            end_time = time.time()
+            end_memory = process.memory_info().rss / (1024 * 1024)  # MB
+            training_duration = end_time - start_time
+            memory_used = end_memory - start_memory
+            cpu_percent = process.cpu_percent(interval=0.1)
+            
+            # Log resource metrics
+            self.root.after(0, lambda: self.add_training_log("📊 Resource Usage Summary:", "success"))
+            self.root.after(0, lambda: self.add_training_log(f"   ⏱️  Training Duration: {training_duration:.2f} seconds ({training_duration/60:.2f} minutes)", "info"))
+            self.root.after(0, lambda: self.add_training_log(f"   🧠 Memory Change: {memory_used:+.2f} MB (Peak: {end_memory:.2f} MB)", "info"))
+            self.root.after(0, lambda: self.add_training_log(f"   ⚡ CPU Usage: {cpu_percent:.1f}%", "info"))
             
             # Stop progress bar
             self.root.after(0, lambda: self.training_progress_bar.stop())
@@ -1275,12 +1550,33 @@ Final Accuracy: {accuracy:.2f}%
             messagebox.showerror("Error", f"Failed to save model:\n{e}")
         
     def create_monitoring_tab(self):
-        """Create enhanced monitoring tab"""
+        """Create enhanced monitoring tab with SCROLLABLE container"""
         monitor_frame = tk.Frame(self.main_notebook, bg='#2c3e50')
         self.main_notebook.add(monitor_frame, text="📈 System Monitor")
         
+        # Create SCROLLABLE container
+        monitor_canvas = tk.Canvas(monitor_frame, bg='#2c3e50', highlightthickness=0)
+        monitor_scrollbar = ttk.Scrollbar(monitor_frame, orient="vertical", command=monitor_canvas.yview)
+        self.monitor_content = tk.Frame(monitor_canvas, bg='#2c3e50')
+        
+        self.monitor_content.bind(
+            "<Configure>",
+            lambda e: monitor_canvas.configure(scrollregion=monitor_canvas.bbox("all"))
+        )
+        
+        monitor_canvas.create_window((0, 0), window=self.monitor_content, anchor="nw")
+        monitor_canvas.configure(yscrollcommand=monitor_scrollbar.set)
+        
+        monitor_canvas.pack(side="left", fill="both", expand=True)
+        monitor_scrollbar.pack(side="right", fill="y")
+        
+        # Enable mouse wheel scrolling
+        def _on_monitor_mousewheel(event):
+            monitor_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        monitor_canvas.bind_all("<MouseWheel>", _on_monitor_mousewheel)
+        
         # Add enhanced monitoring features (simplified for space)
-        self.create_system_resources_monitor(monitor_frame)
+        self.create_system_resources_monitor(self.monitor_content)
         
     def create_system_resources_monitor(self, parent):
         """Create system resources monitor"""
@@ -1308,11 +1604,11 @@ Final Accuracy: {accuracy:.2f}%
         self.memory_label.pack(anchor='w')
         
     def create_results_tab(self):
-        """Create enhanced results tab with comprehensive analysis"""
+        """Create enhanced results tab with comprehensive analysis and SCROLLABLE container"""
         results_frame = tk.Frame(self.main_notebook, bg='#2c3e50')
         self.main_notebook.add(results_frame, text="📊 Results & Analysis")
         
-        # Header
+        # Header (fixed at top)
         header_frame = tk.Frame(results_frame, bg='#0f3460', height=80, relief='raised', bd=3)
         header_frame.pack(fill='x', padx=10, pady=10)
         header_frame.pack_propagate(False)
@@ -1323,8 +1619,29 @@ Final Accuracy: {accuracy:.2f}%
                                       font=('Arial', 14, 'bold'), fg='#f39c12', bg='#0f3460')
         self.results_status.pack()
         
+        # Create SCROLLABLE container
+        results_canvas = tk.Canvas(results_frame, bg='#2c3e50', highlightthickness=0)
+        results_scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=results_canvas.yview)
+        self.results_content = tk.Frame(results_canvas, bg='#2c3e50')
+        
+        self.results_content.bind(
+            "<Configure>",
+            lambda e: results_canvas.configure(scrollregion=results_canvas.bbox("all"))
+        )
+        
+        results_canvas.create_window((0, 0), window=self.results_content, anchor="nw")
+        results_canvas.configure(yscrollcommand=results_scrollbar.set)
+        
+        results_canvas.pack(side="left", fill="both", expand=True)
+        results_scrollbar.pack(side="right", fill="y")
+        
+        # Enable mouse wheel scrolling
+        def _on_results_mousewheel(event):
+            results_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        results_canvas.bind_all("<MouseWheel>", _on_results_mousewheel)
+        
         # Metrics summary
-        metrics_frame = tk.LabelFrame(results_frame, text="📈 Session Metrics", 
+        metrics_frame = tk.LabelFrame(self.results_content, text="📈 Session Metrics", 
                                      font=('Arial', 16, 'bold'), bg='#34495e', fg='white',
                                      padx=20, pady=20)
         metrics_frame.pack(fill='x', padx=10, pady=10)

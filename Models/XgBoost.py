@@ -33,6 +33,7 @@ class XGBoostAudioClassifier:
         )
         self.is_fitted = False
         self.n_estimators = n_estimators  # Store for progress tracking
+        self.n_features_in_ = None  # Track expected feature count
         
     def compile(self, **kwargs):
         """
@@ -65,6 +66,9 @@ class XGBoostAudioClassifier:
         
         X_train = np.array(X_train)
         y_train = np.array(y_train, dtype=np.int32)
+        
+        # Store expected feature count for validation during prediction
+        self.n_features_in_ = X_train.shape[1]
         
         print(f"Training data shape: {X_train.shape}")
         print(f"Memory usage: ~{X_train.nbytes / 1024**2:.1f} MB")
@@ -99,73 +103,37 @@ class XGBoostAudioClassifier:
         print(f"⚡ Learning rate: {self.model.learning_rate}")
         print("="*70)
         
-        # Custom callback to show progress with time estimation
-        import sys
         from datetime import datetime
-        
         start_time = datetime.now()
-        trees_trained = [0]  # Use list to allow modification in callback
-        
-        # Custom callback for progress tracking
-        class ProgressCallback:
-            def __init__(self, total_trees):
-                self.total_trees = total_trees
-                self.start_time = datetime.now()
-                
-            def __call__(self, env):
-                # env.iteration is 0-indexed
-                current_tree = env.iteration + 1
-                trees_trained[0] = current_tree
-                
-                # Calculate progress
-                progress = (current_tree / self.total_trees) * 100
-                elapsed = (datetime.now() - self.start_time).total_seconds()
-                
-                # Estimate remaining time
-                if current_tree > 0:
-                    time_per_tree = elapsed / current_tree
-                    remaining_trees = self.total_trees - current_tree
-                    eta_seconds = time_per_tree * remaining_trees
-                    eta_min = int(eta_seconds // 60)
-                    eta_sec = int(eta_seconds % 60)
-                else:
-                    eta_min, eta_sec = 0, 0
-                
-                # Print progress every 5 trees or at specific milestones
-                if current_tree % 5 == 0 or current_tree == self.total_trees:
-                    sys.stdout.write(f"\r🌳 Progress: {current_tree}/{self.total_trees} trees ({progress:.1f}%) | "
-                                   f"⏱️  Elapsed: {int(elapsed)}s | "
-                                   f"⏳ ETA: {eta_min}m {eta_sec}s     ")
-                    sys.stdout.flush()
-        
-        progress_callback = ProgressCallback(self.n_estimators)
         
         if eval_set:
             print("🔍 Training with validation set for early stopping...")
             print("=" * 70)
             
+            # Use set_params for early_stopping_rounds in newer XGBoost versions
+            self.model.set_params(early_stopping_rounds=10, verbosity=1)
+            
             self.model.fit(
                 X_train, y_train,
                 eval_set=eval_set,
-                early_stopping_rounds=10,  # Stop early if no improvement
-                callbacks=[progress_callback],
-                verbose=False  # Disable default verbose to use our custom one
+                verbose=True  # Show training progress
             )
             
-            print(f"\n⚠️  Early stopping triggered! Stopped at {trees_trained[0]} trees (best iteration)")
+            print(f"\n✅ Training completed with early stopping!")
         else:
             print("📊 Training without validation set...")
             print("=" * 70)
             
+            # Set verbosity to show progress
+            self.model.set_params(verbosity=1)
+            
             self.model.fit(
                 X_train, y_train,
-                callbacks=[progress_callback],
-                verbose=False  # Disable default verbose to use our custom one
+                verbose=True  # Show training progress
             )
         
         elapsed = (datetime.now() - start_time).total_seconds()
-        print(f"\n\n✅ Training completed in {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
-        print(f"🌳 Total trees trained: {trees_trained[0]}")
+        print(f"\n✅ Training completed in {elapsed:.2f} seconds ({elapsed/60:.2f} minutes)")
         print("=" * 70)
         
         self.is_fitted = True
@@ -173,8 +141,8 @@ class XGBoostAudioClassifier:
         print("✅ XGBOOST TRAINING SUCCESSFUL!")
         print("="*70)
         
-        # Calculate training metrics
-        print("Calculating training metrics...")
+        # Calculate training metrics on ALL samples for accurate overfitting detection
+        print(f"\n📊 Calculating training metrics on ALL {len(X_train)} training samples...")
         train_pred = self.model.predict(X_train)
         train_accuracy = accuracy_score(y_train, train_pred)
         train_precision = precision_score(y_train, train_pred, zero_division=0)
@@ -198,23 +166,39 @@ class XGBoostAudioClassifier:
             'val_recall': [val_recall] if val_recall else [None]
         }
         
-        # Print results
-        print(f"\nTraining Results (on subset):")
-        print(f"Accuracy: {train_accuracy:.4f}")
-        print(f"Precision: {train_precision:.4f}")
-        print(f"Recall: {train_recall:.4f}")
+        # Print results with better formatting
+        print(f"\n{'='*70}")
+        print("📊 TRAINING RESULTS")
+        print(f"{'='*70}")
+        print(f"   📈 Training Metrics (on ALL {len(y_train)} samples):")
+        print(f"      • Accuracy:  {train_accuracy:.4f} ({train_accuracy*100:.2f}%)")
+        print(f"      • Precision: {train_precision:.4f}")
+        print(f"      • Recall:    {train_recall:.4f}")
         
         if val_accuracy is not None:
-            print(f"\nValidation Results:")
-            print(f"Val Accuracy: {val_accuracy:.4f}")
-            print(f"Val Precision: {val_precision:.4f}")
-            print(f"Val Recall: {val_recall:.4f}")
+            print(f"\n   🔍 Validation Metrics:")
+            print(f"      • Accuracy:  {val_accuracy:.4f} ({val_accuracy*100:.2f}%)")
+            print(f"      • Precision: {val_precision:.4f}")
+            print(f"      • Recall:    {val_recall:.4f}")
+            
+            # Overfitting detection
+            accuracy_gap = (train_accuracy - val_accuracy) * 100
+            if accuracy_gap > 10:
+                print(f"\n   ⚠️  High overfitting detected!")
+                print(f"      Gap: {accuracy_gap:.2f}% (train - val)")
+                print(f"      💡 Consider: Reduce max_depth, increase min_child_weight, or add regularization")
+            elif accuracy_gap > 5:
+                print(f"\n   ⚡ Moderate overfitting: {accuracy_gap:.2f}% gap")
+            else:
+                print(f"\n   ✅ Good generalization: {accuracy_gap:.2f}% gap")
+        
+        print(f"{'='*70}\n")
         
         return type('History', (), {'history': history})()
     
     def predict(self, X_test):
         """
-        Full-featured prediction method
+        Full-featured prediction method with feature validation
         """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions!")
@@ -222,6 +206,23 @@ class XGBoostAudioClassifier:
         # If X_test is from a dataset batch, flatten it
         if len(X_test.shape) > 2:
             X_test = X_test.reshape(X_test.shape[0], -1)
+        
+        # CRITICAL: Validate feature count matches training data
+        if X_test.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"❌ FEATURE MISMATCH ERROR!\n"
+                f"   Model was trained on {self.n_features_in_} features\n"
+                f"   But prediction data has {X_test.shape[1]} features\n\n"
+                f"💡 SOLUTION:\n"
+                f"   • If trained on SPECTROGRAM data (~16k features):\n"
+                f"     → Use spectrogram dataset for prediction\n"
+                f"   • If trained on MFCC data (40 features):\n"
+                f"     → Use MFCC dataset (mfcc_*) for prediction\n\n"
+                f"   🔍 Training feature type: "
+                f"{'SPECTROGRAM' if self.n_features_in_ > 1000 else 'MFCC'}\n"
+                f"   🔍 Prediction feature type: "
+                f"{'SPECTROGRAM' if X_test.shape[1] > 1000 else 'MFCC'}\n"
+            )
         
         # Get prediction probabilities
         pred_proba = self.model.predict_proba(X_test)
@@ -255,7 +256,7 @@ class XGBoostAudioClassifier:
     
     def save_model(self, filename=None):
         """
-        Save the trained XGBoost model to disk
+        Save the trained XGBoost model to disk (auto-deletes old XGBoost models)
         
         Args:
             filename: Name of the file to save (default: xgboost_model.joblib)
@@ -265,6 +266,23 @@ class XGBoostAudioClassifier:
         """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before saving!")
+        
+        # Delete old XGBoost models first
+        print("\n🗑️  Cleaning up old XGBoost models...")
+        deleted_count = 0
+        for file in os.listdir('.'):
+            if file.endswith(('.joblib', '.pkl')) and ('xgb' in file.lower() or 'xgboost' in file.lower() or 'boost' in file.lower()):
+                try:
+                    os.remove(file)
+                    print(f"   ✅ Deleted: {file}")
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"   ⚠️  Could not delete {file}: {e}")
+        
+        if deleted_count > 0:
+            print(f"   🧹 Cleaned up {deleted_count} old model(s)")
+        else:
+            print(f"   ℹ️  No old models found")
         
         if filename is None:
             from datetime import datetime
@@ -280,8 +298,9 @@ class XGBoostAudioClassifier:
         filepath = os.path.join(current_dir, filename)
         
         # Save model
+        print(f"\n💾 Saving new model...")
         joblib.dump(self, filepath)
-        print(f"✓ XGBoost model saved to: {filepath}")
+        print(f"✅ XGBoost model saved to: {filepath}")
         
         return filepath
 

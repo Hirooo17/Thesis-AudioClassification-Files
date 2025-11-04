@@ -32,6 +32,7 @@ class KNNAudioClassifier:
         # Store parameters for tuning
         self.n_neighbors = n_neighbors
         self.weights = weights
+        self.n_features_in_ = None  # Track expected feature count
         
     def compile(self, **kwargs):
         """
@@ -83,6 +84,9 @@ class KNNAudioClassifier:
         X_train = np.array(X_train)
         y_train = np.array(y_train)
         
+        # Store expected feature count for validation during prediction
+        self.n_features_in_ = X_train.shape[1]
+        
         print(f"\n📊 Dataset Information:")
         print(f"   • Training samples: {X_train.shape[0]}")
         print(f"   • Features per sample: {X_train.shape[1]}")
@@ -119,19 +123,13 @@ class KNNAudioClassifier:
         print(f"✅ Done in {elapsed:.2f} seconds!")
         print("="*70)
         
-        # Calculate training metrics on subset to detect overfitting
-        print("\n📊 Calculating training metrics (on subset to save time)...")
+        # Calculate training metrics on ALL samples for accurate overfitting detection
+        print(f"\n📊 Calculating training metrics on ALL {len(X_train)} training samples...")
         
-        # Use subset for training metrics to save time
-        subset_size = min(1000, len(X_train))
-        indices = np.random.choice(len(X_train), subset_size, replace=False)
-        X_train_subset = X_train[indices]
-        y_train_subset = y_train[indices]
-        
-        train_pred = self.model.predict(X_train_subset)
-        train_accuracy = accuracy_score(y_train_subset, train_pred)
-        train_precision = precision_score(y_train_subset, train_pred, zero_division=0)
-        train_recall = recall_score(y_train_subset, train_pred, zero_division=0)
+        train_pred = self.model.predict(X_train)
+        train_accuracy = accuracy_score(y_train, train_pred)
+        train_precision = precision_score(y_train, train_pred, zero_division=0)
+        train_recall = recall_score(y_train, train_pred, zero_division=0)
         
         # Validation metrics
         val_accuracy, val_precision, val_recall = None, None, None
@@ -183,7 +181,7 @@ class KNNAudioClassifier:
         print(f"\n" + "="*70)
         print("📈 TRAINING RESULTS")
         print("="*70)
-        print(f"Training Metrics (on {subset_size} sample subset):")
+        print(f"Training Metrics (on ALL {len(X_train)} training samples):")
         print(f"   • Accuracy:  {train_accuracy:.4f} ({train_accuracy*100:.2f}%)")
         print(f"   • Precision: {train_precision:.4f}")
         print(f"   • Recall:    {train_recall:.4f}")
@@ -208,7 +206,7 @@ class KNNAudioClassifier:
     
     def predict(self, X_test):
         """
-        Full-featured prediction method with normalization
+        Full-featured prediction method with normalization and feature validation
         """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions!")
@@ -216,6 +214,23 @@ class KNNAudioClassifier:
         # If X_test is from a dataset batch, flatten it
         if len(X_test.shape) > 2:
             X_test = X_test.reshape(X_test.shape[0], -1)
+        
+        # CRITICAL: Validate feature count matches training data
+        if X_test.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"❌ FEATURE MISMATCH ERROR!\n"
+                f"   Model was trained on {self.n_features_in_} features\n"
+                f"   But prediction data has {X_test.shape[1]} features\n\n"
+                f"💡 SOLUTION:\n"
+                f"   • If trained on SPECTROGRAM data (~16k features):\n"
+                f"     → Use spectrogram dataset for prediction\n"
+                f"   • If trained on MFCC data (40 features):\n"
+                f"     → Use MFCC dataset (mfcc_*) for prediction\n\n"
+                f"   🔍 Training feature type: "
+                f"{'SPECTROGRAM' if self.n_features_in_ > 1000 else 'MFCC'}\n"
+                f"   🔍 Prediction feature type: "
+                f"{'SPECTROGRAM' if X_test.shape[1] > 1000 else 'MFCC'}\n"
+            )
         
         # Apply normalization if it was used during training
         if self.normalized and self.scaler is not None:
@@ -269,7 +284,7 @@ class KNNAudioClassifier:
     
     def save_model(self, filename=None):
         """
-        Save the trained KNN model to disk
+        Save the trained KNN model to disk (auto-deletes old KNN models)
         
         Args:
             filename: Name of the file to save (default: knn_model.joblib)
@@ -279,6 +294,23 @@ class KNNAudioClassifier:
         """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before saving!")
+        
+        # Delete old KNN models first
+        print("\n🗑️  Cleaning up old KNN models...")
+        deleted_count = 0
+        for file in os.listdir('.'):
+            if file.endswith(('.joblib', '.pkl')) and ('knn' in file.lower() or 'k_nearest' in file.lower() or 'neighbor' in file.lower()):
+                try:
+                    os.remove(file)
+                    print(f"   ✅ Deleted: {file}")
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"   ⚠️  Could not delete {file}: {e}")
+        
+        if deleted_count > 0:
+            print(f"   🧹 Cleaned up {deleted_count} old model(s)")
+        else:
+            print(f"   ℹ️  No old models found")
         
         if filename is None:
             from datetime import datetime
@@ -294,8 +326,9 @@ class KNNAudioClassifier:
         filepath = os.path.join(current_dir, filename)
         
         # Save model
+        print(f"\n💾 Saving new model...")
         joblib.dump(self, filepath)
-        print(f"✓ KNN model saved to: {filepath}")
+        print(f"✅ KNN model saved to: {filepath}")
         
         return filepath
 

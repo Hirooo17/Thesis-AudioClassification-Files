@@ -7,13 +7,13 @@ import os
 
 # Cell: Full-Featured SVM Model Setup
 class SVMAudioClassifier:
-    def __init__(self, kernel='rbf', C=1.0, gamma='scale', probability=True, random_state=42, max_iter=-1):
+    def __init__(self, kernel='rbf', C=0.1, gamma='scale', probability=True, random_state=42, max_iter=-1):
         """
-        Full-featured SVM classifier for audio classification
+        Full-featured SVM classifier for audio classification with anti-overfitting defaults
         
         Args:
             kernel: SVM kernel type ('linear', 'poly', 'rbf', 'sigmoid')
-            C: Regularization parameter (default: 1.0)
+            C: Regularization parameter (default: 0.1 - REDUCED to prevent overfitting!)
             gamma: Kernel coefficient ('scale', 'auto', or float)
             probability: Enable probability estimates (required for predict_proba)
             random_state: Random state for reproducibility
@@ -27,27 +27,48 @@ class SVMAudioClassifier:
             random_state=random_state,
             cache_size=1000,  # Increase cache for faster training
             max_iter=max_iter,  # Control iterations
-            verbose=True  # Show progress
+            verbose=True,  # Show progress
+            class_weight='balanced'  # AUTO-BALANCE classes to prevent bias
         )
         self.is_fitted = False
         self.kernel = kernel
         self.C = C
+        self.n_features_in_ = None  # Track expected feature count
         
     def compile(self, **kwargs):
         """Compile method for consistency with other models"""
         print("="*70)
-        print("🔧 SVM MODEL CONFIGURATION")
+        print("🔧 SVM MODEL CONFIGURATION (ANTI-OVERFITTING MODE)")
         print("="*70)
         print(f"🎯 Kernel: {self.model.kernel}")
         print(f"📊 Regularization (C): {self.model.C}")
         print(f"🔢 Gamma: {self.model.gamma}")
+        print(f"⚖️  Class Weight: {self.model.class_weight}")
         print(f"💾 Cache Size: {self.model.cache_size} MB")
         print(f"🔄 Max Iterations: {self.model.max_iter}")
         print(f"📈 Probability Estimates: {self.model.probability}")
-        print("\n💡 Tips for faster training:")
+        
+        # Overfitting risk assessment
+        print(f"\n🛡️  OVERFITTING PREVENTION:")
+        if self.model.C <= 0.1:
+            print(f"   ✅ C={self.model.C} - Strong regularization (GOOD!)")
+        elif self.model.C <= 0.5:
+            print(f"   ⚠️  C={self.model.C} - Moderate regularization")
+        else:
+            print(f"   ❌ C={self.model.C} - Weak regularization (HIGH RISK!)")
+            print(f"      → Reduce C to 0.01-0.1 to prevent overfitting")
+        
+        if self.model.kernel == 'linear':
+            print(f"   ✅ Linear kernel - Simple model (GOOD!)")
+        else:
+            print(f"   ⚠️  {self.model.kernel.upper()} kernel - Complex model")
+            print(f"      → Switch to 'linear' for small datasets")
+        
+        print(f"\n💡 Tips for faster training:")
         print("   • Use kernel='linear' for large datasets")
         print("   • Normalize features (critical for SVM!)")
         print("   • Set max_iter=1000-5000 for time limit")
+        print("   • Lower C value = Less overfitting but may reduce accuracy")
         print("="*70)
         
     def fit(self, train_data, epochs=None, validation_data=None, normalize=True):
@@ -74,10 +95,21 @@ class SVMAudioClassifier:
         X_train = np.array(X_train)
         y_train = np.array(y_train)
         
+        # Store expected feature count for validation during prediction
+        self.n_features_in_ = X_train.shape[1]
+        
         print(f"\n📊 Dataset Information:")
         print(f"   • Training samples: {X_train.shape[0]}")
         print(f"   • Features per sample: {X_train.shape[1]}")
         print(f"   • Memory usage: ~{X_train.nbytes / 1024**2:.1f} MB")
+        
+        # Check dataset size for overfitting risk
+        if X_train.shape[0] < 5000:
+            print(f"\n⚠️  WARNING: Small dataset ({X_train.shape[0]} samples)")
+            print(f"   💡 Risk of overfitting! Recommendations:")
+            print(f"      • Use C <= 0.1 (current: {self.C})")
+            print(f"      • Use kernel='linear' (current: {self.kernel})")
+            print(f"      • Collect more training data if possible")
         
         # Normalize features (CRITICAL for SVM performance!)
         if normalize:
@@ -123,18 +155,13 @@ class SVMAudioClassifier:
         self.is_fitted = True
         print("="*70)
         
-        # Calculate training metrics on subset to save time
-        print("\n📊 Calculating training metrics (on subset to save time)...")
+        # Calculate training metrics on ALL samples for accurate overfitting detection
+        print(f"\n📊 Calculating training metrics on ALL {len(X_train)} training samples...")
         
-        subset_size = min(1000, len(X_train))
-        indices = np.random.choice(len(X_train), subset_size, replace=False)
-        X_train_subset = X_train[indices]
-        y_train_subset = y_train[indices]
-        
-        train_pred = self.model.predict(X_train_subset)
-        train_accuracy = accuracy_score(y_train_subset, train_pred)
-        train_precision = precision_score(y_train_subset, train_pred, zero_division=0)
-        train_recall = recall_score(y_train_subset, train_pred, zero_division=0)
+        train_pred = self.model.predict(X_train)
+        train_accuracy = accuracy_score(y_train, train_pred)
+        train_precision = precision_score(y_train, train_pred, zero_division=0)
+        train_recall = recall_score(y_train, train_pred, zero_division=0)
         
         # Process validation data if provided
         val_accuracy, val_precision, val_recall = None, None, None
@@ -160,17 +187,36 @@ class SVMAudioClassifier:
             val_precision = precision_score(y_val, val_pred, zero_division=0)
             val_recall = recall_score(y_val, val_pred, zero_division=0)
             
-            # Check for overfitting
+            # Check for overfitting with detailed analysis
             accuracy_gap = train_accuracy - val_accuracy
             if accuracy_gap > 0.10:  # More than 10% gap
-                print(f"\n⚠️  WARNING: Potential overfitting detected!")
-                print(f"   Training accuracy: {train_accuracy:.4f}")
-                print(f"   Validation accuracy: {val_accuracy:.4f}")
+                print(f"\n❌ SEVERE OVERFITTING DETECTED!")
+                print(f"   Training accuracy: {train_accuracy:.4f} ({train_accuracy*100:.2f}%)")
+                print(f"   Validation accuracy: {val_accuracy:.4f} ({val_accuracy*100:.2f}%)")
                 print(f"   Gap: {accuracy_gap:.4f} ({accuracy_gap*100:.1f}%)")
-                print(f"\n💡 Suggestions to reduce overfitting:")
-                print(f"   • Decrease C (current: {self.C}) - try C=0.1 or C=0.01")
-                print(f"   • Try kernel='linear' for simpler model")
-                print(f"   • Ensure normalization is enabled (current: {self.normalized})")
+                print(f"\n� IMMEDIATE FIXES NEEDED:")
+                if self.C >= 0.5:
+                    print(f"   ❗ C is TOO HIGH ({self.C}):")
+                    print(f"      • Try C=0.01 for maximum regularization")
+                    print(f"      • Try C=0.05 for moderate regularization")
+                    print(f"      • Try C=0.1 for light regularization")
+                if self.kernel == 'rbf':
+                    print(f"   ❗ RBF kernel may be too complex:")
+                    print(f"      • Switch to kernel='linear' for simpler model")
+                    print(f"      • Linear kernel works better with small datasets")
+                if X_train.shape[0] < 5000:
+                    print(f"   ❗ Dataset is small ({X_train.shape[0]} samples):")
+                    print(f"      • Collect more training data (target: 10k+ samples)")
+                    print(f"      • Use data augmentation techniques")
+                    print(f"      • Consider using simpler model (linear)")
+                
+                # Calculate support vector ratio for complexity analysis
+                if hasattr(self.model, 'support_'):
+                    sv_ratio = len(self.model.support_) / len(X_train)
+                    if sv_ratio > 0.4:
+                        print(f"   ❗ Too many support vectors ({sv_ratio:.1%}):")
+                        print(f"      • Model is memorizing training data")
+                        print(f"      • Reduce C to simplify decision boundary")
         
         # Create history dictionary
         history = {
@@ -186,7 +232,7 @@ class SVMAudioClassifier:
         print(f"\n" + "="*70)
         print("📈 TRAINING RESULTS")
         print("="*70)
-        print(f"Training Metrics (on {subset_size} sample subset):")
+        print(f"Training Metrics (on ALL {len(X_train)} training samples):")
         print(f"   • Accuracy:  {train_accuracy:.4f} ({train_accuracy*100:.2f}%)")
         print(f"   • Precision: {train_precision:.4f}")
         print(f"   • Recall:    {train_recall:.4f}")
@@ -225,13 +271,30 @@ class SVMAudioClassifier:
         return type('History', (), {'history': history})()
     
     def predict(self, X_test):
-        """Full-featured prediction method with normalization"""
+        """Full-featured prediction method with normalization and feature validation"""
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions!")
         
         # If X_test is from a dataset batch, flatten it
         if len(X_test.shape) > 2:
             X_test = X_test.reshape(X_test.shape[0], -1)
+        
+        # CRITICAL: Validate feature count matches training data
+        if X_test.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"❌ FEATURE MISMATCH ERROR!\n"
+                f"   Model was trained on {self.n_features_in_} features\n"
+                f"   But prediction data has {X_test.shape[1]} features\n\n"
+                f"💡 SOLUTION:\n"
+                f"   • If trained on SPECTROGRAM data (~16k features):\n"
+                f"     → Use spectrogram dataset for prediction\n"
+                f"   • If trained on MFCC data (40 features):\n"
+                f"     → Use MFCC dataset (mfcc_*) for prediction\n\n"
+                f"   🔍 Training feature type: "
+                f"{'SPECTROGRAM' if self.n_features_in_ > 1000 else 'MFCC'}\n"
+                f"   🔍 Prediction feature type: "
+                f"{'SPECTROGRAM' if X_test.shape[1] > 1000 else 'MFCC'}\n"
+            )
         
         # Apply normalization if it was used during training
         if self.normalized and self.scaler is not None:
@@ -291,7 +354,7 @@ class SVMAudioClassifier:
     
     def save_model(self, filename=None):
         """
-        Save the trained SVM model to disk
+        Save the trained SVM model to disk (auto-deletes old SVM models)
         
         Args:
             filename: Name of the file to save (default: svm_model.joblib)
@@ -301,6 +364,23 @@ class SVMAudioClassifier:
         """
         if not self.is_fitted:
             raise ValueError("Model must be fitted before saving!")
+        
+        # Delete old SVM models first
+        print("\n🗑️  Cleaning up old SVM models...")
+        deleted_count = 0
+        for file in os.listdir('.'):
+            if file.endswith(('.joblib', '.pkl')) and ('svm' in file.lower() or 'support' in file.lower() or 'vector' in file.lower()):
+                try:
+                    os.remove(file)
+                    print(f"   ✅ Deleted: {file}")
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"   ⚠️  Could not delete {file}: {e}")
+        
+        if deleted_count > 0:
+            print(f"   🧹 Cleaned up {deleted_count} old model(s)")
+        else:
+            print(f"   ℹ️  No old models found")
         
         if filename is None:
             from datetime import datetime
@@ -316,8 +396,9 @@ class SVMAudioClassifier:
         filepath = os.path.join(current_dir, filename)
         
         # Save model
+        print(f"\n💾 Saving new model...")
         joblib.dump(self, filepath)
-        print(f"✓ SVM model saved to: {filepath}")
+        print(f"✅ SVM model saved to: {filepath}")
         
         return filepath
 

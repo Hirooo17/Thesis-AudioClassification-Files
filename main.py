@@ -874,6 +874,94 @@ print("="*70)
 print("\n📁 Currently Available Models:")
 saved_models = list_saved_models()
 
+def verify_dataset_samples(dataset_dict):
+    """
+    Verify and display the actual number of samples in loaded datasets
+    
+    Args:
+        dataset_dict: Dictionary of datasets with 'train', 'val', 'test' keys
+    
+    Returns:
+        Dictionary with sample counts per dataset
+    """
+    print("\n🔍 DATASET VERIFICATION")
+    print("="*70)
+    
+    verification_results = {}
+    
+    for dataset_name, dataset_data in dataset_dict.items():
+        print(f"\n📊 Verifying: {dataset_name}")
+        
+        try:
+            # Count samples in each split
+            train_count = 0
+            val_count = 0
+            test_count = 0
+            
+            # Count training samples
+            if 'train' in dataset_data and dataset_data['train'] is not None:
+                for _ in dataset_data['train'].unbatch():
+                    train_count += 1
+            
+            # Count validation samples
+            if 'val' in dataset_data and dataset_data['val'] is not None:
+                for _ in dataset_data['val'].unbatch():
+                    val_count += 1
+            
+            # Count test samples
+            if 'test' in dataset_data and dataset_data['test'] is not None:
+                for _ in dataset_data['test'].unbatch():
+                    test_count += 1
+            
+            total_count = train_count + val_count + test_count
+            
+            # Store results
+            verification_results[dataset_name] = {
+                'train': train_count,
+                'val': val_count,
+                'test': test_count,
+                'total': total_count
+            }
+            
+            # Display results
+            print(f"   ✅ Train:      {train_count:,} samples")
+            print(f"   ✅ Validation: {val_count:,} samples")
+            print(f"   ✅ Test:       {test_count:,} samples")
+            print(f"   ✅ TOTAL:      {total_count:,} samples")
+            
+            # Check if it matches expected 5000 (3500/750/750 split)
+            if dataset_name == 'safe_5000':
+                expected_train = 3500
+                expected_val = 750
+                expected_test = 750
+                expected_total = 5000
+                
+                if train_count == expected_train and val_count == expected_val and test_count == expected_test:
+                    print(f"   🎯 ✅ PERFECT! Matches expected split (3500/750/750)")
+                else:
+                    print(f"   ⚠️  WARNING: Does not match expected split!")
+                    print(f"      Expected: {expected_train}/{expected_val}/{expected_test} = {expected_total}")
+                    print(f"      Got:      {train_count}/{val_count}/{test_count} = {total_count}")
+        
+        except Exception as e:
+            print(f"   ❌ Error verifying {dataset_name}: {e}")
+            verification_results[dataset_name] = {'error': str(e)}
+    
+    print("\n" + "="*70)
+    print("📊 VERIFICATION SUMMARY:")
+    print("="*70)
+    
+    for dataset_name, counts in verification_results.items():
+        if 'error' not in counts:
+            print(f"   {dataset_name}: {counts['total']:,} samples ({counts['train']}/{counts['val']}/{counts['test']})")
+        else:
+            print(f"   {dataset_name}: ERROR")
+    
+    print("="*70)
+    
+    return verification_results
+
+
 def auto_load_all_models():
     """
     Automatically detect and load all saved model files
@@ -1121,6 +1209,11 @@ if __name__ == "__main__":
             print(f"   • {ds_name}")
     
     print("="*70)
+    
+    # Verify dataset sample counts
+    if all_datasets:
+        print("\n🔍 Verifying dataset sample counts...")
+        verification_results = verify_dataset_samples(all_datasets)
     
     # Create a dictionary of all available models
     all_models = {
