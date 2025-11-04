@@ -46,6 +46,12 @@ class AdvancedSimulationAudioGUI:
         self.current_prediction = ""
         self.current_confidence = 0.0
         
+        # Confusion matrix tracking for precision/recall
+        self.true_positives = 0   # Predicted Real, Actually Real
+        self.false_positives = 0  # Predicted Real, Actually Fake
+        self.true_negatives = 0   # Predicted Fake, Actually Fake
+        self.false_negatives = 0  # Predicted Fake, Actually Real
+        
         # Performance tracking
         self.performance_history = []
         self.real_time_metrics = {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1': 0}
@@ -264,6 +270,40 @@ class AdvancedSimulationAudioGUI:
         self.live_accuracy = tk.Label(accuracy_frame, text="0.0%", font=('Arial', 24, 'bold'), 
                                      bg='#9b59b6', fg='white')
         self.live_accuracy.pack()
+        
+        # Detailed metrics row
+        metrics_row = tk.Frame(progress_frame, bg='#2c3e50')
+        metrics_row.pack(fill='x', pady=10)
+        
+        # Precision
+        precision_frame = tk.Frame(metrics_row, bg='#3498db', relief='raised', bd=2)
+        precision_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        tk.Label(precision_frame, text="📊 PRECISION", font=('Arial', 10, 'bold'), 
+                bg='#3498db', fg='white').pack(pady=3)
+        self.live_precision = tk.Label(precision_frame, text="0.0%", font=('Arial', 16, 'bold'), 
+                                      bg='#3498db', fg='white')
+        self.live_precision.pack(pady=2)
+        
+        # Recall
+        recall_frame = tk.Frame(metrics_row, bg='#e67e22', relief='raised', bd=2)
+        recall_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        tk.Label(recall_frame, text="🎪 RECALL", font=('Arial', 10, 'bold'), 
+                bg='#e67e22', fg='white').pack(pady=3)
+        self.live_recall = tk.Label(recall_frame, text="0.0%", font=('Arial', 16, 'bold'), 
+                                    bg='#e67e22', fg='white')
+        self.live_recall.pack(pady=2)
+        
+        # F1-Score
+        f1_frame = tk.Frame(metrics_row, bg='#16a085', relief='raised', bd=2)
+        f1_frame.pack(side='left', fill='both', expand=True, padx=5)
+        
+        tk.Label(f1_frame, text="⚖️ F1-SCORE", font=('Arial', 10, 'bold'), 
+                bg='#16a085', fg='white').pack(pady=3)
+        self.live_f1 = tk.Label(f1_frame, text="0.0%", font=('Arial', 16, 'bold'), 
+                               bg='#16a085', fg='white')
+        self.live_f1.pack(pady=2)
         
         # Enhanced progress bars
         self.create_enhanced_progress_bars(progress_frame)
@@ -550,6 +590,12 @@ class AdvancedSimulationAudioGUI:
         self.recent_predictions = []
         self.prediction_history = []
         
+        # Reset confusion matrix
+        self.true_positives = 0
+        self.false_positives = 0
+        self.true_negatives = 0
+        self.false_negatives = 0
+        
         self.main_status.config(text="🔥 LIVE PREDICTION ACTIVE", fg='#00ff88')
         self.predict_btn.config(state='disabled', bg='#95a5a6')
         
@@ -649,10 +695,22 @@ class AdvancedSimulationAudioGUI:
                 # Determine if prediction is correct
                 is_correct = (predicted_label == actual_label)
                 
-                # Update counters
+                # Update counters and confusion matrix
                 self.total_predictions += 1
                 if is_correct:
                     self.correct_predictions += 1
+                
+                # Update confusion matrix for precision/recall calculation
+                # Label 1 = Real Audio (Positive class)
+                # Label 0 = Fake Audio (Negative class)
+                if predicted_label == 1 and actual_label == 1:
+                    self.true_positives += 1  # Correctly predicted Real
+                elif predicted_label == 1 and actual_label == 0:
+                    self.false_positives += 1  # Incorrectly predicted Real (was Fake)
+                elif predicted_label == 0 and actual_label == 0:
+                    self.true_negatives += 1  # Correctly predicted Fake
+                elif predicted_label == 0 and actual_label == 1:
+                    self.false_negatives += 1  # Incorrectly predicted Fake (was Real)
                 
                 # Store prediction data
                 prediction_data = {
@@ -733,12 +791,26 @@ class AdvancedSimulationAudioGUI:
         self.correct_counter.config(text=str(self.correct_predictions))
         self.incorrect_counter.config(text=str(self.total_predictions - self.correct_predictions))
         
-        # Update live accuracy
-        accuracy = (self.correct_predictions / self.total_predictions) * 100
+        # Calculate metrics
+        accuracy = (self.correct_predictions / self.total_predictions) * 100 if self.total_predictions > 0 else 0
+        
+        # Calculate Precision: TP / (TP + FP)
+        precision = (self.true_positives / (self.true_positives + self.false_positives) * 100) if (self.true_positives + self.false_positives) > 0 else 0
+        
+        # Calculate Recall: TP / (TP + FN)
+        recall = (self.true_positives / (self.true_positives + self.false_negatives) * 100) if (self.true_positives + self.false_negatives) > 0 else 0
+        
+        # Calculate F1-Score: 2 * (Precision * Recall) / (Precision + Recall)
+        f1_score = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
+        
+        # Update displays
         self.live_accuracy.config(text=f"{accuracy:.1f}%")
+        self.live_precision.config(text=f"{precision:.1f}%")
+        self.live_recall.config(text=f"{recall:.1f}%")
+        self.live_f1.config(text=f"{f1_score:.1f}%")
         
         # Update live counter in header
-        self.live_counter.config(text=f"🎯 Predictions: {self.correct_predictions}/{self.total_predictions} | Accuracy: {accuracy:.1f}%")
+        self.live_counter.config(text=f"🎯 Predictions: {self.correct_predictions}/{self.total_predictions} | Acc: {accuracy:.1f}% | Prec: {precision:.1f}%")
         
         # Update visualizations
         self.update_live_visualizations()
@@ -868,6 +940,38 @@ class AdvancedSimulationAudioGUI:
         self.add_prediction_log(f"❌ Incorrect Predictions: {incorrect}", "incorrect")
         self.add_prediction_log(f"🎯 Final Accuracy: {accuracy:.2f}%", "info")
         
+        # Confusion Matrix Display
+        self.add_prediction_log("", "info")
+        self.add_prediction_log("📋 CONFUSION MATRIX:", "info")
+        self.add_prediction_log("-" * 60, "info")
+        self.add_prediction_log(f"  True Positives  (Real → Real):  {self.true_positives}", "correct")
+        self.add_prediction_log(f"  False Positives (Fake → Real):  {self.false_positives}", "incorrect")
+        self.add_prediction_log(f"  True Negatives  (Fake → Fake):  {self.true_negatives}", "correct")
+        self.add_prediction_log(f"  False Negatives (Real → Fake):  {self.false_negatives}", "incorrect")
+        self.add_prediction_log("-" * 60, "info")
+        
+        # Calculate and display detailed metrics
+        if (self.true_positives + self.false_positives) > 0:
+            precision = (self.true_positives / (self.true_positives + self.false_positives)) * 100
+            self.add_prediction_log(f"🎯 Precision: {precision:.2f}% (Correct Real predictions)", "info")
+        else:
+            self.add_prediction_log(f"🎯 Precision: N/A (No Real predictions made)", "warning")
+        
+        if (self.true_positives + self.false_negatives) > 0:
+            recall = (self.true_positives / (self.true_positives + self.false_negatives)) * 100
+            self.add_prediction_log(f"📊 Recall: {recall:.2f}% (Real audio detection rate)", "info")
+        else:
+            self.add_prediction_log(f"📊 Recall: N/A (No Real samples in dataset)", "warning")
+        
+        if (self.true_positives + self.false_positives) > 0 and (self.true_positives + self.false_negatives) > 0:
+            precision_val = self.true_positives / (self.true_positives + self.false_positives)
+            recall_val = self.true_positives / (self.true_positives + self.false_negatives)
+            if (precision_val + recall_val) > 0:
+                f1 = 2 * (precision_val * recall_val) / (precision_val + recall_val) * 100
+                self.add_prediction_log(f"⚖️ F1-Score: {f1:.2f}% (Harmonic mean)", "info")
+        
+        self.add_prediction_log("", "info")
+        
         # Accuracy assessment
         if accuracy >= 90:
             self.add_prediction_log("🏆 EXCELLENT PERFORMANCE!", "correct")
@@ -953,6 +1057,12 @@ Final Accuracy: {accuracy:.2f}%
         self.prediction_history = []
         self.operation_progress = 0
         
+        # Reset confusion matrix
+        self.true_positives = 0
+        self.false_positives = 0
+        self.true_negatives = 0
+        self.false_negatives = 0
+        
         # Reset displays
         self.main_status.config(text="🟢 SYSTEM READY", fg='#00ff88')
         self.live_counter.config(text="🎯 Predictions: 0/0 | Accuracy: 0%")
@@ -966,6 +1076,9 @@ Final Accuracy: {accuracy:.2f}%
         self.correct_counter.config(text="0")
         self.incorrect_counter.config(text="0")
         self.live_accuracy.config(text="0.0%")
+        self.live_precision.config(text="0.0%")
+        self.live_recall.config(text="0.0%")
+        self.live_f1.config(text="0.0%")
         
         # Reset progress
         self.operation_label.config(text="Ready to start operations...")
@@ -1979,18 +2092,41 @@ Date: {report_date}
                 ax1.text(0.1, 0.5, session_info, fontsize=11, family='monospace',
                         verticalalignment='center')
                 
-                # Performance Metrics
+                # Performance Metrics with Confusion Matrix
                 ax2 = plt.subplot(3, 2, 2)
                 ax2.axis('off')
                 accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
+                
+                # Calculate precision, recall, F1
+                precision = (self.true_positives / (self.true_positives + self.false_positives) * 100) if (self.true_positives + self.false_positives) > 0 else 0
+                recall = (self.true_positives / (self.true_positives + self.false_negatives) * 100) if (self.true_positives + self.false_negatives) > 0 else 0
+                
+                if precision > 0 and recall > 0:
+                    f1 = 2 * (precision * recall) / (precision + recall)
+                else:
+                    f1 = 0
+                
                 metrics_info = f"""
 PERFORMANCE METRICS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✓ Correct: {self.correct_predictions}
 ✗ Incorrect: {self.total_predictions - self.correct_predictions}
 🎯 Accuracy: {accuracy:.2f}%
+
+CONFUSION MATRIX
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+True Positives:  {self.true_positives}
+False Positives: {self.false_positives}
+True Negatives:  {self.true_negatives}
+False Negatives: {self.false_negatives}
+
+DETAILED METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Precision: {precision:.2f}%
+Recall:    {recall:.2f}%
+F1-Score:  {f1:.2f}%
                 """
-                ax2.text(0.1, 0.5, metrics_info, fontsize=11, family='monospace',
+                ax2.text(0.1, 0.5, metrics_info, fontsize=9, family='monospace',
                         verticalalignment='center')
                 
                 # Accuracy Chart
@@ -2121,6 +2257,41 @@ PERFORMANCE METRICS
                 
                 writer.writerow([])
                 
+                # Confusion Matrix
+                writer.writerow(['CONFUSION MATRIX'])
+                writer.writerow(['True Positives (Real → Real)', self.true_positives])
+                writer.writerow(['False Positives (Fake → Real)', self.false_positives])
+                writer.writerow(['True Negatives (Fake → Fake)', self.true_negatives])
+                writer.writerow(['False Negatives (Real → Fake)', self.false_negatives])
+                writer.writerow([])
+                
+                # Detailed Metrics
+                writer.writerow(['DETAILED METRICS'])
+                if (self.true_positives + self.false_positives) > 0:
+                    precision = (self.true_positives / (self.true_positives + self.false_positives)) * 100
+                    writer.writerow(['Precision (%)', f'{precision:.2f}'])
+                else:
+                    writer.writerow(['Precision (%)', 'N/A'])
+                
+                if (self.true_positives + self.false_negatives) > 0:
+                    recall = (self.true_positives / (self.true_positives + self.false_negatives)) * 100
+                    writer.writerow(['Recall (%)', f'{recall:.2f}'])
+                else:
+                    writer.writerow(['Recall (%)', 'N/A'])
+                
+                if (self.true_positives + self.false_positives) > 0 and (self.true_positives + self.false_negatives) > 0:
+                    precision_val = self.true_positives / (self.true_positives + self.false_positives)
+                    recall_val = self.true_positives / (self.true_positives + self.false_negatives)
+                    if (precision_val + recall_val) > 0:
+                        f1 = 2 * (precision_val * recall_val) / (precision_val + recall_val) * 100
+                        writer.writerow(['F1-Score (%)', f'{f1:.2f}'])
+                    else:
+                        writer.writerow(['F1-Score (%)', 'N/A'])
+                else:
+                    writer.writerow(['F1-Score (%)', 'N/A'])
+                
+                writer.writerow([])
+                
                 # Detailed results
                 writer.writerow(['DETAILED PREDICTION RESULTS'])
                 writer.writerow(['Sample #', 'Actual Label', 'Predicted Label', 'Confidence', 
@@ -2185,6 +2356,47 @@ PERFORMANCE METRICS
             summary.append(f"Correct Predictions:     {self.correct_predictions}")
             summary.append(f"Incorrect Predictions:   {self.total_predictions - self.correct_predictions}")
             summary.append(f"Accuracy:                {accuracy:.2f}%")
+            summary.append("")
+            
+            summary.append("-" * 80)
+            summary.append("CONFUSION MATRIX")
+            summary.append("-" * 80)
+            summary.append(f"True Positives  (Real → Real):    {self.true_positives}")
+            summary.append(f"False Positives (Fake → Real):    {self.false_positives}")
+            summary.append(f"True Negatives  (Fake → Fake):    {self.true_negatives}")
+            summary.append(f"False Negatives (Real → Fake):    {self.false_negatives}")
+            summary.append("")
+            
+            summary.append("-" * 80)
+            summary.append("DETAILED METRICS")
+            summary.append("-" * 80)
+            
+            # Calculate precision
+            if (self.true_positives + self.false_positives) > 0:
+                precision = (self.true_positives / (self.true_positives + self.false_positives)) * 100
+                summary.append(f"Precision:               {precision:.2f}% (Correct Real predictions)")
+            else:
+                summary.append(f"Precision:               N/A (No Real predictions made)")
+            
+            # Calculate recall
+            if (self.true_positives + self.false_negatives) > 0:
+                recall = (self.true_positives / (self.true_positives + self.false_negatives)) * 100
+                summary.append(f"Recall:                  {recall:.2f}% (Real audio detection rate)")
+            else:
+                summary.append(f"Recall:                  N/A (No Real samples in dataset)")
+            
+            # Calculate F1-Score
+            if (self.true_positives + self.false_positives) > 0 and (self.true_positives + self.false_negatives) > 0:
+                precision_val = self.true_positives / (self.true_positives + self.false_positives)
+                recall_val = self.true_positives / (self.true_positives + self.false_negatives)
+                if (precision_val + recall_val) > 0:
+                    f1 = 2 * (precision_val * recall_val) / (precision_val + recall_val) * 100
+                    summary.append(f"F1-Score:                {f1:.2f}% (Harmonic mean)")
+                else:
+                    summary.append(f"F1-Score:                N/A")
+            else:
+                summary.append(f"F1-Score:                N/A")
+            
             summary.append("")
             
             if self.prediction_history:
