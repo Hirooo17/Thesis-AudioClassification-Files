@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 import threading
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -12,6 +12,8 @@ import joblib
 import sys
 import os
 import psutil
+import csv
+from matplotlib.backends.backend_pdf import PdfPages
 
 class AdvancedSimulationAudioGUI:
     def __init__(self, root, loaded_models, loaded_datasets):
@@ -1619,6 +1621,25 @@ Final Accuracy: {accuracy:.2f}%
                                       font=('Arial', 14, 'bold'), fg='#f39c12', bg='#0f3460')
         self.results_status.pack()
         
+        # Export buttons row
+        export_frame = tk.Frame(results_frame, bg='#2c3e50')
+        export_frame.pack(fill='x', padx=10, pady=5)
+        
+        tk.Button(export_frame, text="📄 Export to PDF", 
+                 command=self.export_to_pdf,
+                 bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'),
+                 height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
+        
+        tk.Button(export_frame, text="📊 Export to CSV", 
+                 command=self.export_to_csv,
+                 bg='#27ae60', fg='white', font=('Arial', 12, 'bold'),
+                 height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
+        
+        tk.Button(export_frame, text="📋 Export Summary", 
+                 command=self.export_summary_txt,
+                 bg='#3498db', fg='white', font=('Arial', 12, 'bold'),
+                 height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
+        
         # Create SCROLLABLE container
         results_canvas = tk.Canvas(results_frame, bg='#2c3e50', highlightthickness=0)
         results_scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=results_canvas.yview)
@@ -1915,6 +1936,313 @@ Final Accuracy: {accuracy:.2f}%
         """Update log display"""
         # Process any queued log messages
         self.root.after(100, self.update_logs)
+    
+    def export_to_pdf(self):
+        """Export comprehensive analysis to PDF"""
+        if self.total_predictions == 0:
+            messagebox.showwarning("No Data", "No prediction data available to export!")
+            return
+        
+        try:
+            # Ask for save location
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                filetypes=[("PDF files", "*.pdf")],
+                initialfile=f"Audio_Classification_Report_{timestamp}.pdf"
+            )
+            
+            if not filename:
+                return
+            
+            # Create PDF with matplotlib
+            with PdfPages(filename) as pdf:
+                # Page 1: Summary and Metrics
+                fig = plt.figure(figsize=(11, 8.5))
+                fig.suptitle('Audio Classification Analysis Report', fontsize=20, weight='bold')
+                
+                # Add metadata
+                report_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+                plt.figtext(0.5, 0.92, f'Generated: {report_date}', ha='center', fontsize=10)
+                
+                # Session Information
+                ax1 = plt.subplot(3, 2, 1)
+                ax1.axis('off')
+                session_info = f"""
+SESSION INFORMATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Model: {self.selected_model.get()}
+Dataset: {self.selected_dataset.get()}
+Total Predictions: {self.total_predictions}
+Date: {report_date}
+                """
+                ax1.text(0.1, 0.5, session_info, fontsize=11, family='monospace',
+                        verticalalignment='center')
+                
+                # Performance Metrics
+                ax2 = plt.subplot(3, 2, 2)
+                ax2.axis('off')
+                accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
+                metrics_info = f"""
+PERFORMANCE METRICS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✓ Correct: {self.correct_predictions}
+✗ Incorrect: {self.total_predictions - self.correct_predictions}
+🎯 Accuracy: {accuracy:.2f}%
+                """
+                ax2.text(0.1, 0.5, metrics_info, fontsize=11, family='monospace',
+                        verticalalignment='center')
+                
+                # Accuracy Chart
+                ax3 = plt.subplot(3, 2, (3, 4))
+                if len(self.prediction_history) > 0:
+                    running_accuracy = []
+                    correct_count = 0
+                    for i, pred in enumerate(self.prediction_history):
+                        if pred['correct']:
+                            correct_count += 1
+                        running_accuracy.append(correct_count / (i + 1))
+                    
+                    sample_numbers = list(range(1, len(running_accuracy) + 1))
+                    ax3.plot(sample_numbers, running_accuracy, 'b-', linewidth=2)
+                    ax3.fill_between(sample_numbers, running_accuracy, alpha=0.3)
+                    ax3.set_xlabel('Prediction Number', fontsize=10)
+                    ax3.set_ylabel('Running Accuracy', fontsize=10)
+                    ax3.set_title('Running Accuracy Over Time', fontsize=12, weight='bold')
+                    ax3.grid(True, alpha=0.3)
+                    ax3.set_ylim(0, 1)
+                
+                # Confidence Distribution
+                ax4 = plt.subplot(3, 2, (5, 6))
+                if len(self.prediction_history) > 0:
+                    confidences = [pred['confidence'] for pred in self.prediction_history]
+                    colors = ['green' if pred['correct'] else 'red' for pred in self.prediction_history]
+                    sample_nums = list(range(1, len(confidences) + 1))
+                    ax4.bar(sample_nums, confidences, color=colors, alpha=0.6)
+                    ax4.axhline(y=0.5, color='orange', linestyle='--', linewidth=2, label='Threshold')
+                    ax4.set_xlabel('Prediction Number', fontsize=10)
+                    ax4.set_ylabel('Confidence', fontsize=10)
+                    ax4.set_title('Prediction Confidence Distribution', fontsize=12, weight='bold')
+                    ax4.legend()
+                    ax4.grid(True, alpha=0.3)
+                    ax4.set_ylim(0, 1)
+                
+                plt.tight_layout(rect=[0, 0, 1, 0.96])
+                pdf.savefig(fig)
+                plt.close(fig)
+                
+                # Page 2: Detailed Prediction Table (if we have data)
+                if len(self.prediction_history) > 0:
+                    fig2 = plt.figure(figsize=(11, 8.5))
+                    fig2.suptitle('Detailed Prediction Results', fontsize=16, weight='bold')
+                    ax = fig2.add_subplot(111)
+                    ax.axis('off')
+                    
+                    # Create table data
+                    table_data = [['#', 'Actual', 'Predicted', 'Confidence', 'Result']]
+                    for i, pred in enumerate(self.prediction_history[:50], 1):  # First 50 predictions
+                        actual = 'Real' if pred['actual'] == 1 else 'Fake'
+                        predicted = 'Real' if pred['predicted'] == 1 else 'Fake'
+                        confidence = f"{pred['confidence']:.2%}"
+                        result = '✓ Correct' if pred['correct'] else '✗ Wrong'
+                        table_data.append([str(i), actual, predicted, confidence, result])
+                    
+                    # Create table
+                    table = ax.table(cellText=table_data, cellLoc='center', loc='center',
+                                   colWidths=[0.1, 0.2, 0.2, 0.2, 0.2])
+                    table.auto_set_font_size(False)
+                    table.set_fontsize(9)
+                    table.scale(1, 2)
+                    
+                    # Style header row
+                    for i in range(5):
+                        table[(0, i)].set_facecolor('#3498db')
+                        table[(0, i)].set_text_props(weight='bold', color='white')
+                    
+                    # Color code results
+                    for i in range(1, len(table_data)):
+                        if '✓' in table_data[i][4]:
+                            table[(i, 4)].set_facecolor('#d5f4e6')
+                        else:
+                            table[(i, 4)].set_facecolor('#fadbd8')
+                    
+                    plt.figtext(0.5, 0.95, f'Showing first 50 of {len(self.prediction_history)} predictions',
+                              ha='center', fontsize=10)
+                    
+                    pdf.savefig(fig2)
+                    plt.close(fig2)
+            
+            messagebox.showinfo("Export Successful", 
+                              f"Report exported successfully to:\n{filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export PDF:\n{str(e)}")
+    
+    def export_to_csv(self):
+        """Export detailed prediction results to CSV"""
+        if self.total_predictions == 0:
+            messagebox.showwarning("No Data", "No prediction data available to export!")
+            return
+        
+        try:
+            # Ask for save location
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                initialfile=f"Audio_Classification_Results_{timestamp}.csv"
+            )
+            
+            if not filename:
+                return
+            
+            # Write CSV
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                
+                # Header information
+                writer.writerow(['Audio Classification Results'])
+                writer.writerow(['Generated:', datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow(['Model:', self.selected_model.get()])
+                writer.writerow(['Dataset:', self.selected_dataset.get()])
+                writer.writerow([])
+                
+                # Summary statistics
+                accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
+                writer.writerow(['SUMMARY STATISTICS'])
+                writer.writerow(['Total Predictions', self.total_predictions])
+                writer.writerow(['Correct Predictions', self.correct_predictions])
+                writer.writerow(['Incorrect Predictions', self.total_predictions - self.correct_predictions])
+                writer.writerow(['Accuracy (%)', f'{accuracy:.2f}'])
+                
+                if self.prediction_history:
+                    avg_confidence = np.mean([p['confidence'] for p in self.prediction_history])
+                    writer.writerow(['Average Confidence', f'{avg_confidence:.2%}'])
+                
+                writer.writerow([])
+                
+                # Detailed results
+                writer.writerow(['DETAILED PREDICTION RESULTS'])
+                writer.writerow(['Sample #', 'Actual Label', 'Predicted Label', 'Confidence', 
+                               'Result', 'Dataset Info'])
+                
+                for i, pred in enumerate(self.prediction_history, 1):
+                    actual = 'Real Audio' if pred['actual'] == 1 else 'Fake Audio'
+                    predicted = 'Real Audio' if pred['predicted'] == 1 else 'Fake Audio'
+                    confidence = f"{pred['confidence']:.4f}"
+                    result = 'Correct' if pred['correct'] else 'Incorrect'
+                    dataset_info = pred.get('dataset', 'N/A')
+                    
+                    writer.writerow([i, actual, predicted, confidence, result, dataset_info])
+            
+            messagebox.showinfo("Export Successful", 
+                              f"Results exported successfully to:\n{filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export CSV:\n{str(e)}")
+    
+    def export_summary_txt(self):
+        """Export comprehensive summary as formatted text file"""
+        if self.total_predictions == 0:
+            messagebox.showwarning("No Data", "No prediction data available to export!")
+            return
+        
+        try:
+            # Ask for save location
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt")],
+                initialfile=f"Audio_Classification_Summary_{timestamp}.txt"
+            )
+            
+            if not filename:
+                return
+            
+            # Calculate statistics
+            accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
+            
+            # Build comprehensive summary
+            summary = []
+            summary.append("=" * 80)
+            summary.append("AUDIO CLASSIFICATION ANALYSIS SUMMARY")
+            summary.append("=" * 80)
+            summary.append("")
+            summary.append(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M:%S %p')}")
+            summary.append("")
+            
+            summary.append("-" * 80)
+            summary.append("SESSION INFORMATION")
+            summary.append("-" * 80)
+            summary.append(f"Model Used:           {self.selected_model.get()}")
+            summary.append(f"Dataset:              {self.selected_dataset.get()}")
+            summary.append(f"Total Predictions:    {self.total_predictions}")
+            summary.append("")
+            
+            summary.append("-" * 80)
+            summary.append("PERFORMANCE METRICS")
+            summary.append("-" * 80)
+            summary.append(f"Correct Predictions:     {self.correct_predictions}")
+            summary.append(f"Incorrect Predictions:   {self.total_predictions - self.correct_predictions}")
+            summary.append(f"Accuracy:                {accuracy:.2f}%")
+            summary.append("")
+            
+            if self.prediction_history:
+                avg_confidence = np.mean([p['confidence'] for p in self.prediction_history])
+                max_confidence = np.max([p['confidence'] for p in self.prediction_history])
+                min_confidence = np.min([p['confidence'] for p in self.prediction_history])
+                
+                summary.append("-" * 80)
+                summary.append("CONFIDENCE STATISTICS")
+                summary.append("-" * 80)
+                summary.append(f"Average Confidence:   {avg_confidence:.2%}")
+                summary.append(f"Maximum Confidence:   {max_confidence:.2%}")
+                summary.append(f"Minimum Confidence:   {min_confidence:.2%}")
+                summary.append("")
+            
+            # Performance assessment
+            summary.append("-" * 80)
+            summary.append("PERFORMANCE ASSESSMENT")
+            summary.append("-" * 80)
+            if accuracy >= 90:
+                assessment = "EXCELLENT - Model shows outstanding performance!"
+            elif accuracy >= 80:
+                assessment = "GOOD - Model performs well with room for improvement"
+            elif accuracy >= 70:
+                assessment = "MODERATE - Consider model tuning or additional training"
+            else:
+                assessment = "NEEDS IMPROVEMENT - Review model parameters and training data"
+            summary.append(f"Overall Rating: {assessment}")
+            summary.append("")
+            
+            # Sample predictions
+            summary.append("-" * 80)
+            summary.append("SAMPLE PREDICTIONS (First 20)")
+            summary.append("-" * 80)
+            summary.append(f"{'#':<5} {'Actual':<12} {'Predicted':<12} {'Confidence':<12} {'Result':<10}")
+            summary.append("-" * 80)
+            
+            for i, pred in enumerate(self.prediction_history[:20], 1):
+                actual = 'Real' if pred['actual'] == 1 else 'Fake'
+                predicted = 'Real' if pred['predicted'] == 1 else 'Fake'
+                confidence = f"{pred['confidence']:.2%}"
+                result = 'Correct' if pred['correct'] else 'Incorrect'
+                summary.append(f"{i:<5} {actual:<12} {predicted:<12} {confidence:<12} {result:<10}")
+            
+            summary.append("")
+            summary.append("=" * 80)
+            summary.append("END OF REPORT")
+            summary.append("=" * 80)
+            
+            # Write to file
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(summary))
+            
+            messagebox.showinfo("Export Successful", 
+                              f"Summary exported successfully to:\n{filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export summary:\n{str(e)}")
 
 # Launch the Advanced Simulation GUI
 def launch_advanced_simulation_gui(model, datasets_dict):
