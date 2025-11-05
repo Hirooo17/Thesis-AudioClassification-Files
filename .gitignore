@@ -16,7 +16,7 @@
 !/Models/KNN.py
 !/Models/SVM.py
 !/Models/CNN.py
-!/Models/RandomForest.py
+!/Models/RandomForrest.py
 !/Models/XGBoost.py
 !/Utilities/hardware_computation.py
 
