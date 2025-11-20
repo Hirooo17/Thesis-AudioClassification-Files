@@ -24,11 +24,13 @@ class XGBoostAudioClassifier:
             max_depth=max_depth,
             learning_rate=learning_rate,
             random_state=random_state,
-            n_jobs=-1,  # Use all available cores for maximum performance
+            n_jobs=1,  # CHANGED: Use single thread to reduce memory
             eval_metric='logloss',
-            tree_method='hist',  # Efficient tree method
+            tree_method='hist',  # Memory-efficient histogram method
             subsample=0.8,  # Use subset of training data for each tree
             colsample_bytree=0.8,  # Use subset of features for each tree
+            max_bin=128,  # ADDED: Reduce histogram bins to save memory (default=256)
+            grow_policy='depthwise',  # ADDED: Memory-efficient growth policy
             verbosity=2  # Show detailed training progress (2 = info level)
         )
         self.is_fitted = False
@@ -41,8 +43,10 @@ class XGBoostAudioClassifier:
         """
         print("Full-Featured XGBoost model 'compiled' successfully!")
         print(f"Model parameters: n_estimators={self.model.n_estimators}, max_depth={self.model.max_depth}")
-        print(f"Learning rate: {self.model.learning_rate}, n_jobs={self.model.n_jobs} (using all cores)")
-        print(f"Tree method: {self.model.tree_method}, Subsample: {self.model.subsample}")
+        print(f"Learning rate: {self.model.learning_rate}, n_jobs={self.model.n_jobs}")
+        print(f"Tree method: {self.model.tree_method}, Max bins: {self.model.max_bin}")
+        print(f"Subsample: {self.model.subsample}, Growth policy: {self.model.grow_policy}")
+        print("⚠️  Memory-optimized settings enabled for large datasets")
         
     def fit(self, train_data, epochs=None, validation_data=None):
         """

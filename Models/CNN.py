@@ -296,10 +296,44 @@ class CNNAudioClassifier:
         Args:
             filepath: Path to the saved model
         """
+        import numpy as np
+        
+        print(f"🔄 Loading model from: {filepath}")
         self.model = tf.keras.models.load_model(filepath)
+        print(f"   ✓ Model loaded successfully")
+        
+        # Compile the model to remove warnings (for .h5 files)
+        self.model.compile(
+            optimizer='adam',
+            loss='binary_crossentropy',
+            metrics=['accuracy']
+        )
+        print(f"   ✓ Model compiled")
+        
+        # CRITICAL: Build the model by calling it with dummy input
+        # This initializes all layers and allows Grad-CAM to access outputs
+        print(f"   🔨 Building model with dummy input...")
+        dummy_input = np.zeros((1, 128, 128, 1), dtype=np.float32)
+        
+        # Make a prediction to ensure model is fully built
+        test_output = self.model(dummy_input, training=False)
+        print(f"   ✓ Model built - test output shape: {test_output.shape}")
+        
+        # Verify model.built property
+        print(f"   ✓ Model.built status: {self.model.built}")
+        
+        # Debug: Print all layer shapes to verify they're built
+        print(f"   📊 Layer output shapes:")
+        for i, layer in enumerate(self.model.layers):
+            try:
+                output_shape = layer.output.shape if hasattr(layer, 'output') else 'N/A'
+                print(f"      Layer {i}: {layer.name} ({layer.__class__.__name__}) - {output_shape}")
+            except:
+                print(f"      Layer {i}: {layer.name} ({layer.__class__.__name__}) - Shape not available yet")
+        
         self.is_compiled = True
         self.is_fitted = True
-        print(f"✅ Model loaded from: {filepath}")
+        print(f"✅ Model fully initialized and ready for explainability!")
 
 
 # Helper function to create and compile a CNN model
