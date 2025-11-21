@@ -82,6 +82,26 @@ class CNNTrainingGUI:
         self.true_negatives = 0
         self.false_negatives = 0
         
+        # Detailed classification report tracking
+        self.classification_report = {
+            'class_0': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0},
+            'class_1': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0},
+            'accuracy': 0,
+            'macro_avg': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0},
+            'weighted_avg': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0}
+        }
+        
+        # Training performance tracking
+        self.training_start_time = None
+        self.training_end_time = None
+        self.training_duration = 0
+        self.peak_memory_mb = 0
+        self.avg_memory_mb = 0
+        
+        # SNR degradation tracking
+        self.snr_degradation_data = []
+        self.current_snr_level = None
+        
         # Explainability tracking
         self.explainability_data = []
         self.current_explain_sample = None
@@ -1518,6 +1538,75 @@ class CNNTrainingGUI:
         self.log_training(f"   Duration: {self.resource_stats['duration_seconds']/60:.2f} min")
         self.log_training(f"   Avg CPU: {self.resource_stats['avg_cpu_percent']:.1f}% | Peak: {self.resource_stats['max_cpu_percent']:.1f}%")
         self.log_training(f"   Peak Memory: {self.resource_stats['peak_memory_mb']:.2f} MB")
+    
+    def analyze_snr_degradation(self):
+        """Analyze accuracy degradation across SNR levels"""
+        # SNR levels and their corresponding accuracy (to be filled during prediction)
+        snr_levels = [5, 10, 15, 20, 'clean']
+        
+        # Check if we have SNR-specific datasets loaded
+        dataset_name = self.current_dataset_info.get('dataset_name', '')
+        
+        # Extract SNR level from dataset name if applicable
+        current_snr = None
+        if 'snr_5db' in dataset_name.lower() or '5db' in dataset_name.lower():
+            current_snr = 5
+        elif 'snr_10db' in dataset_name.lower() or '10db' in dataset_name.lower():
+            current_snr = 10
+        elif 'snr_15db' in dataset_name.lower() or '15db' in dataset_name.lower():
+            current_snr = 15
+        elif 'snr_20db' in dataset_name.lower() or '20db' in dataset_name.lower():
+            current_snr = 20
+        
+        # Calculate degradation rate (requires baseline accuracy at clean/high SNR)
+        # For now, store the current results
+        if current_snr and hasattr(self, 'classification_report'):
+            accuracy = self.classification_report.get('accuracy', 0) * 100
+            
+            # Store SNR data point
+            self.snr_degradation_data.append({
+                'snr_db': current_snr,
+                'accuracy': accuracy,
+                'dataset': dataset_name
+            })
+            
+            print(f"\n📊 SNR Level: {current_snr} dB | Accuracy: {accuracy:.2f}%")
+        
+        # If we have multiple SNR data points, calculate degradation
+        if len(self.snr_degradation_data) > 1:
+            # Sort by SNR level
+            sorted_data = sorted(self.snr_degradation_data, key=lambda x: x['snr_db'])
+            
+            print(f"\n{'='*70}")
+            print(f"📉 ACCURACY DEGRADATION RATE ANALYSIS")
+            print(f"{'='*70}")
+            print(f"{'SNR Range (dB)':<20} {'Degradation Rate':<25} {'Classification':<25}")
+            print(f"{'-'*70}")
+            
+            # Calculate degradation between consecutive SNR levels
+            for i in range(len(sorted_data) - 1):
+                snr_low = sorted_data[i]['snr_db']
+                snr_high = sorted_data[i + 1]['snr_db']
+                acc_low = sorted_data[i]['accuracy']
+                acc_high = sorted_data[i + 1]['accuracy']
+                
+                degradation_rate = acc_high - acc_low
+                degradation_per_db = degradation_rate / (snr_high - snr_low)
+                
+                # Classify degradation
+                if abs(degradation_per_db) < 0.5:
+                    classification = "Minimal"
+                elif abs(degradation_per_db) < 1.5:
+                    classification = "Moderate"
+                elif abs(degradation_per_db) < 3.0:
+                    classification = "Significant"
+                else:
+                    classification = "Severe"
+                
+                print(f"{f'{snr_low} -> {snr_high} dB':<20} {f'{degradation_rate:+.2f}% ({degradation_per_db:+.2f}%/dB)':<25} {classification:<25}")
+            
+            print(f"{'='*70}\n")
+    
     def analyze_sample(self):
         """Analyze a specific sample and generate explanations"""
         if self.cnn_model is None or self.cnn_model.model is None:
@@ -3525,6 +3614,7 @@ WHY THIS PREDICTION?
                 print(f"   💾 ModelCheckpoint enabled: {checkpoint_path}")
             
             self.start_time = time.time()
+            self.training_start_time = datetime.now()
             
             # Start hardware monitoring
             print(f"\n🖥️ Starting hardware resource monitoring...")
@@ -3591,17 +3681,26 @@ WHY THIS PREDICTION?
             self.cnn_model.is_fitted = True
             
             # Training complete
+            self.training_end_time = datetime.now()
             elapsed_time = time.time() - self.start_time
+            self.training_duration = elapsed_time
             
             # Stop hardware monitoring
             print(f"\n🖥️ Stopping hardware resource monitoring...")
             self.stop_resource_monitoring()
+            
+            # Calculate memory statistics
+            if self.resource_stats:
+                self.peak_memory_mb = self.resource_stats.get('peak_memory_mb', 0)
+                self.avg_memory_mb = self.resource_stats.get('avg_memory_mb', 0)
             
             # Terminal summary
             print(f"\n{'='*60}")
             print(f"🎉 TRAINING COMPLETED!")
             print(f"{'='*60}")
             print(f"⏱️  Total Time: {elapsed_time:.2f} seconds ({elapsed_time/60:.2f} minutes)")
+            print(f"🧠 Peak Memory: {self.peak_memory_mb:.2f} MB")
+            print(f"🧠 Avg Memory: {self.avg_memory_mb:.2f} MB")
             print(f"📊 Total Epochs: {len(self.epoch_history['epoch'])}")
             if len(self.epoch_history['accuracy']) > 0:
                 print(f"📈 Final Training Accuracy: {self.epoch_history['accuracy'][-1]*100:.2f}%")
@@ -3825,6 +3924,57 @@ WHY THIS PREDICTION?
             # Update display
             self.root.after(0, self.update_prediction_display)
             
+            # Calculate detailed classification report
+            from sklearn.metrics import classification_report
+            y_true = [p['actual'] for p in self.prediction_history]
+            y_pred = [p['predicted'] for p in self.prediction_history]
+            
+            # Generate classification report
+            class_report = classification_report(y_true, y_pred, target_names=['Class 0 (Fake)', 'Class 1 (Real)'], output_dict=True, zero_division=0)
+            
+            # Store in our tracking structure
+            self.classification_report = {
+                'class_0': {
+                    'precision': class_report['Class 0 (Fake)']['precision'],
+                    'recall': class_report['Class 0 (Fake)']['recall'],
+                    'f1-score': class_report['Class 0 (Fake)']['f1-score'],
+                    'support': class_report['Class 0 (Fake)']['support']
+                },
+                'class_1': {
+                    'precision': class_report['Class 1 (Real)']['precision'],
+                    'recall': class_report['Class 1 (Real)']['recall'],
+                    'f1-score': class_report['Class 1 (Real)']['f1-score'],
+                    'support': class_report['Class 1 (Real)']['support']
+                },
+                'accuracy': class_report['accuracy'],
+                'macro_avg': {
+                    'precision': class_report['macro avg']['precision'],
+                    'recall': class_report['macro avg']['recall'],
+                    'f1-score': class_report['macro avg']['f1-score'],
+                    'support': class_report['macro avg']['support']
+                },
+                'weighted_avg': {
+                    'precision': class_report['weighted avg']['precision'],
+                    'recall': class_report['weighted avg']['recall'],
+                    'f1-score': class_report['weighted avg']['f1-score'],
+                    'support': class_report['weighted avg']['support']
+                }
+            }
+            
+            # Print detailed classification report
+            print(f"\n{'='*60}")
+            print(f"📊 DETAILED CLASSIFICATION REPORT")
+            print(f"{'='*60}")
+            print(f"{'Class':<20} {'Precision':<12} {'Recall':<12} {'F1-Score':<12} {'Support':<10}")
+            print(f"{'-'*70}")
+            print(f"{'Class 0 (Fake)':<20} {self.classification_report['class_0']['precision']:<12.4f} {self.classification_report['class_0']['recall']:<12.4f} {self.classification_report['class_0']['f1-score']:<12.4f} {int(self.classification_report['class_0']['support']):<10}")
+            print(f"{'Class 1 (Real)':<20} {self.classification_report['class_1']['precision']:<12.4f} {self.classification_report['class_1']['recall']:<12.4f} {self.classification_report['class_1']['f1-score']:<12.4f} {int(self.classification_report['class_1']['support']):<10}")
+            print(f"{'-'*70}")
+            print(f"{'Accuracy':<20} {'':<12} {'':<12} {self.classification_report['accuracy']:<12.4f} {int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support']):<10}")
+            print(f"{'Macro Avg':<20} {self.classification_report['macro_avg']['precision']:<12.4f} {self.classification_report['macro_avg']['recall']:<12.4f} {self.classification_report['macro_avg']['f1-score']:<12.4f} {int(self.classification_report['macro_avg']['support']):<10}")
+            print(f"{'Weighted Avg':<20} {self.classification_report['weighted_avg']['precision']:<12.4f} {self.classification_report['weighted_avg']['recall']:<12.4f} {self.classification_report['weighted_avg']['f1-score']:<12.4f} {int(self.classification_report['weighted_avg']['support']):<10}")
+            print(f"{'='*60}\n")
+            
             # CRITICAL DEBUG: Analyze prediction distribution
             import numpy as np
             pred_probs_array = np.array(pred_probs_list)
@@ -3864,6 +4014,9 @@ WHY THIS PREDICTION?
             self.log_prediction(f"🔍 Pred range: [{pred_probs_array.min():.4f}, {pred_probs_array.max():.4f}], Mean: {pred_probs_array.mean():.4f}")
             self.log_prediction(f"📊 Actual: {np.sum(actual_labels_array == 0)} fake, {np.sum(actual_labels_array == 1)} real")
             self.log_prediction(f"📊 Predicted: {np.sum(pred_labels_array == 0)} fake, {np.sum(pred_labels_array == 1)} real")
+            
+            # Analyze SNR degradation if applicable
+            self.analyze_snr_degradation()
             
         except Exception as e:
             import traceback
@@ -3988,7 +4141,15 @@ WHY THIS PREDICTION?
                     y_pos -= 0.08
                     fig.text(0.1, y_pos, 'HARDWARE RESOURCE USAGE:', fontsize=14, weight='bold')
                     y_pos -= 0.05
-                    fig.text(0.1, y_pos, f"Training Duration: {self.resource_stats['duration_seconds']:.2f} sec ({self.resource_stats['duration_seconds']/60:.2f} min)", fontsize=11)
+                    
+                    # Training time
+                    if self.training_start_time and self.training_end_time:
+                        fig.text(0.1, y_pos, f"Start Time: {self.training_start_time.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=11)
+                        y_pos -= 0.04
+                        fig.text(0.1, y_pos, f"End Time: {self.training_end_time.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=11)
+                        y_pos -= 0.04
+                    
+                    fig.text(0.1, y_pos, f"Training Duration: {self.training_duration:.2f} sec ({self.training_duration/60:.2f} min)", fontsize=11)
                     y_pos -= 0.04
                     fig.text(0.1, y_pos, f"CPU Cores: {psutil.cpu_count(logical=True)}", fontsize=11)
                     y_pos -= 0.04
@@ -3996,14 +4157,14 @@ WHY THIS PREDICTION?
                     y_pos -= 0.04
                     fig.text(0.1, y_pos, f"Peak CPU Usage: {self.resource_stats['max_cpu_percent']:.1f}%", fontsize=11)
                     y_pos -= 0.04
-                    fig.text(0.1, y_pos, f"Peak Memory: {self.resource_stats['peak_memory_mb']:.2f} MB", fontsize=11)
+                    fig.text(0.1, y_pos, f"Peak Memory: {self.peak_memory_mb:.2f} MB", fontsize=11, weight='bold')
                     y_pos -= 0.04
-                    fig.text(0.1, y_pos, f"Average Memory: {self.resource_stats['avg_memory_mb']:.2f} MB", fontsize=11)
+                    fig.text(0.1, y_pos, f"Average Memory: {self.avg_memory_mb:.2f} MB", fontsize=11)
                     y_pos -= 0.04
                     fig.text(0.1, y_pos, f"Memory Increase: {self.resource_stats['memory_increase_mb']:.2f} MB", fontsize=11)
                     if self.current_dataset_info['total_samples']['train'] > 0:
                         y_pos -= 0.04
-                        samples_per_sec = self.current_dataset_info['total_samples']['train'] / self.resource_stats['duration_seconds']
+                        samples_per_sec = self.current_dataset_info['total_samples']['train'] / self.training_duration
                         fig.text(0.1, y_pos, f"Efficiency: {samples_per_sec:.2f} samples/sec", fontsize=11)
                 
                 pdf.savefig(fig)
@@ -4069,6 +4230,145 @@ WHY THIS PREDICTION?
                     plt.tight_layout()
                     pdf.savefig(fig)
                     plt.close(fig)
+                
+                # Page 4: Detailed Classification Report (if predictions were made)
+                if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
+                    fig = plt.figure(figsize=(11, 8.5))
+                    fig.text(0.5, 0.95, 'Detailed Classification Report', 
+                            ha='center', fontsize=18, weight='bold')
+                    
+                    y_pos = 0.85
+                    fig.text(0.1, y_pos, 'PREDICTION METRICS:', fontsize=14, weight='bold')
+                    y_pos -= 0.05
+                    
+                    # Classification table header
+                    fig.text(0.1, y_pos, 'Class', fontsize=12, weight='bold')
+                    fig.text(0.3, y_pos, 'Precision', fontsize=12, weight='bold')
+                    fig.text(0.45, y_pos, 'Recall', fontsize=12, weight='bold')
+                    fig.text(0.6, y_pos, 'F1-Score', fontsize=12, weight='bold')
+                    fig.text(0.75, y_pos, 'Support', fontsize=12, weight='bold')
+                    y_pos -= 0.03
+                    
+                    # Draw horizontal line
+                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    y_pos -= 0.02
+                    
+                    # Class 0 (Fake)
+                    fig.text(0.1, y_pos, 'Class 0 (Fake)', fontsize=11)
+                    fig.text(0.3, y_pos, f"{self.classification_report['class_0']['precision']:.4f}", fontsize=11)
+                    fig.text(0.45, y_pos, f"{self.classification_report['class_0']['recall']:.4f}", fontsize=11)
+                    fig.text(0.6, y_pos, f"{self.classification_report['class_0']['f1-score']:.4f}", fontsize=11)
+                    fig.text(0.75, y_pos, f"{int(self.classification_report['class_0']['support'])}", fontsize=11)
+                    y_pos -= 0.04
+                    
+                    # Class 1 (Real)
+                    fig.text(0.1, y_pos, 'Class 1 (Real)', fontsize=11)
+                    fig.text(0.3, y_pos, f"{self.classification_report['class_1']['precision']:.4f}", fontsize=11)
+                    fig.text(0.45, y_pos, f"{self.classification_report['class_1']['recall']:.4f}", fontsize=11)
+                    fig.text(0.6, y_pos, f"{self.classification_report['class_1']['f1-score']:.4f}", fontsize=11)
+                    fig.text(0.75, y_pos, f"{int(self.classification_report['class_1']['support'])}", fontsize=11)
+                    y_pos -= 0.02
+                    
+                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    y_pos -= 0.02
+                    
+                    # Accuracy
+                    fig.text(0.1, y_pos, 'Accuracy', fontsize=11, weight='bold')
+                    fig.text(0.6, y_pos, f"{self.classification_report['accuracy']:.4f}", fontsize=11, weight='bold')
+                    total_support = int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support'])
+                    fig.text(0.75, y_pos, f"{total_support}", fontsize=11, weight='bold')
+                    y_pos -= 0.04
+                    
+                    # Macro Average
+                    fig.text(0.1, y_pos, 'Macro Avg', fontsize=11)
+                    fig.text(0.3, y_pos, f"{self.classification_report['macro_avg']['precision']:.4f}", fontsize=11)
+                    fig.text(0.45, y_pos, f"{self.classification_report['macro_avg']['recall']:.4f}", fontsize=11)
+                    fig.text(0.6, y_pos, f"{self.classification_report['macro_avg']['f1-score']:.4f}", fontsize=11)
+                    fig.text(0.75, y_pos, f"{total_support}", fontsize=11)
+                    y_pos -= 0.04
+                    
+                    # Weighted Average
+                    fig.text(0.1, y_pos, 'Weighted Avg', fontsize=11)
+                    fig.text(0.3, y_pos, f"{self.classification_report['weighted_avg']['precision']:.4f}", fontsize=11)
+                    fig.text(0.45, y_pos, f"{self.classification_report['weighted_avg']['recall']:.4f}", fontsize=11)
+                    fig.text(0.6, y_pos, f"{self.classification_report['weighted_avg']['f1-score']:.4f}", fontsize=11)
+                    fig.text(0.75, y_pos, f"{total_support}", fontsize=11)
+                    y_pos -= 0.08
+                    
+                    # Confusion Matrix
+                    fig.text(0.1, y_pos, 'CONFUSION MATRIX:', fontsize=14, weight='bold')
+                    y_pos -= 0.05
+                    fig.text(0.1, y_pos, f"True Positives (Real correctly classified): {self.true_positives}", fontsize=11)
+                    y_pos -= 0.04
+                    fig.text(0.1, y_pos, f"False Positives (Fake classified as Real): {self.false_positives}", fontsize=11)
+                    y_pos -= 0.04
+                    fig.text(0.1, y_pos, f"True Negatives (Fake correctly classified): {self.true_negatives}", fontsize=11)
+                    y_pos -= 0.04
+                    fig.text(0.1, y_pos, f"False Negatives (Real classified as Fake): {self.false_negatives}", fontsize=11)
+                    
+                    pdf.savefig(fig)
+                    plt.close(fig)
+                
+                # Page 5: SNR Degradation Analysis (if available)
+                if len(self.snr_degradation_data) > 1:
+                    fig = plt.figure(figsize=(11, 8.5))
+                    fig.text(0.5, 0.95, 'Accuracy Degradation Rate Analysis', 
+                            ha='center', fontsize=18, weight='bold')
+                    
+                    y_pos = 0.85
+                    fig.text(0.1, y_pos, 'SNR DEGRADATION ANALYSIS:', fontsize=14, weight='bold')
+                    y_pos -= 0.05
+                    
+                    # Sort by SNR level
+                    sorted_data = sorted(self.snr_degradation_data, key=lambda x: x['snr_db'])
+                    
+                    # Table header
+                    fig.text(0.1, y_pos, 'SNR Range (dB)', fontsize=12, weight='bold')
+                    fig.text(0.35, y_pos, 'Degradation Rate', fontsize=12, weight='bold')
+                    fig.text(0.65, y_pos, 'Classification', fontsize=12, weight='bold')
+                    y_pos -= 0.03
+                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    y_pos -= 0.02
+                    
+                    # Calculate degradation between consecutive SNR levels
+                    for i in range(len(sorted_data) - 1):
+                        snr_low = sorted_data[i]['snr_db']
+                        snr_high = sorted_data[i + 1]['snr_db']
+                        acc_low = sorted_data[i]['accuracy']
+                        acc_high = sorted_data[i + 1]['accuracy']
+                        
+                        degradation_rate = acc_high - acc_low
+                        degradation_per_db = degradation_rate / (snr_high - snr_low)
+                        
+                        # Classify degradation
+                        if abs(degradation_per_db) < 0.5:
+                            classification = "Minimal"
+                        elif abs(degradation_per_db) < 1.5:
+                            classification = "Moderate"
+                        elif abs(degradation_per_db) < 3.0:
+                            classification = "Significant"
+                        else:
+                            classification = "Severe"
+                        
+                        fig.text(0.1, y_pos, f"{snr_low} → {snr_high} dB", fontsize=11)
+                        fig.text(0.35, y_pos, f"{degradation_rate:+.2f}% ({degradation_per_db:+.2f}%/dB)", fontsize=11)
+                        fig.text(0.65, y_pos, classification, fontsize=11)
+                        y_pos -= 0.04
+                    
+                    # Plot SNR vs Accuracy graph
+                    snr_levels = [d['snr_db'] for d in sorted_data]
+                    accuracies = [d['accuracy'] for d in sorted_data]
+                    
+                    ax = fig.add_subplot(111)
+                    ax.set_position([0.15, 0.15, 0.75, 0.4])
+                    ax.plot(snr_levels, accuracies, 'bo-', linewidth=2, markersize=8)
+                    ax.set_xlabel('SNR Level (dB)', fontsize=12, weight='bold')
+                    ax.set_ylabel('Accuracy (%)', fontsize=12, weight='bold')
+                    ax.set_title('Model Performance vs SNR Level', fontsize=14, weight='bold')
+                    ax.grid(True, alpha=0.3)
+                    
+                    pdf.savefig(fig)
+                    plt.close(fig)
             
             messagebox.showinfo("Success", f"Report exported to:\n{filename}")
             
@@ -4117,6 +4417,96 @@ WHY THIS PREDICTION?
                 accuracy = (self.correct_predictions / self.total_predictions) * 100 if self.total_predictions > 0 else 0
                 precision = (self.true_positives / (self.true_positives + self.false_positives) * 100) if (self.true_positives + self.false_positives) > 0 else 0
                 recall = (self.true_positives / (self.true_positives + self.false_negatives) * 100) if (self.true_positives + self.false_negatives) > 0 else 0
+                f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+                
+                writer.writerow(['Overall Metrics Summary'])
+                writer.writerow(['Total Predictions', self.total_predictions])
+                writer.writerow(['Correct Predictions', self.correct_predictions])
+                writer.writerow(['Incorrect Predictions', self.total_predictions - self.correct_predictions])
+                writer.writerow(['Accuracy (%)', f"{accuracy:.2f}"])
+                writer.writerow(['Precision (%)', f"{precision:.2f}"])
+                writer.writerow(['Recall (%)', f"{recall:.2f}"])
+                writer.writerow(['F1-Score (%)', f"{f1:.2f}"])
+                writer.writerow([])
+                
+                # Detailed Classification Report
+                if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
+                    writer.writerow(['Detailed Classification Report'])
+                    writer.writerow(['Class', 'Precision', 'Recall', 'F1-Score', 'Support'])
+                    writer.writerow(['Class 0 (Fake)', 
+                                   f"{self.classification_report['class_0']['precision']:.4f}",
+                                   f"{self.classification_report['class_0']['recall']:.4f}",
+                                   f"{self.classification_report['class_0']['f1-score']:.4f}",
+                                   int(self.classification_report['class_0']['support'])])
+                    writer.writerow(['Class 1 (Real)', 
+                                   f"{self.classification_report['class_1']['precision']:.4f}",
+                                   f"{self.classification_report['class_1']['recall']:.4f}",
+                                   f"{self.classification_report['class_1']['f1-score']:.4f}",
+                                   int(self.classification_report['class_1']['support'])])
+                    writer.writerow(['---', '---', '---', '---', '---'])
+                    writer.writerow(['Accuracy', '', '', 
+                                   f"{self.classification_report['accuracy']:.4f}",
+                                   int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support'])])
+                    writer.writerow(['Macro Avg', 
+                                   f"{self.classification_report['macro_avg']['precision']:.4f}",
+                                   f"{self.classification_report['macro_avg']['recall']:.4f}",
+                                   f"{self.classification_report['macro_avg']['f1-score']:.4f}",
+                                   int(self.classification_report['macro_avg']['support'])])
+                    writer.writerow(['Weighted Avg', 
+                                   f"{self.classification_report['weighted_avg']['precision']:.4f}",
+                                   f"{self.classification_report['weighted_avg']['recall']:.4f}",
+                                   f"{self.classification_report['weighted_avg']['f1-score']:.4f}",
+                                   int(self.classification_report['weighted_avg']['support'])])
+                    writer.writerow([])
+                
+                # Training Performance Metrics
+                if self.training_start_time and self.training_end_time:
+                    writer.writerow(['Training Performance Metrics'])
+                    writer.writerow(['Training Start Time', self.training_start_time.strftime('%Y-%m-%d %H:%M:%S')])
+                    writer.writerow(['Training End Time', self.training_end_time.strftime('%Y-%m-%d %H:%M:%S')])
+                    writer.writerow(['Training Duration (seconds)', f"{self.training_duration:.2f}"])
+                    writer.writerow(['Training Duration (minutes)', f"{self.training_duration/60:.2f}"])
+                    writer.writerow(['Peak Memory Usage (MB)', f"{self.peak_memory_mb:.2f}"])
+                    writer.writerow(['Average Memory Usage (MB)', f"{self.avg_memory_mb:.2f}"])
+                    writer.writerow([])
+                
+                # SNR Degradation Analysis
+                if len(self.snr_degradation_data) > 1:
+                    writer.writerow(['SNR Degradation Analysis'])
+                    writer.writerow(['SNR Range (dB)', 'Degradation Rate (%)', 'Degradation Per dB (%/dB)', 'Classification'])
+                    
+                    sorted_data = sorted(self.snr_degradation_data, key=lambda x: x['snr_db'])
+                    for i in range(len(sorted_data) - 1):
+                        snr_low = sorted_data[i]['snr_db']
+                        snr_high = sorted_data[i + 1]['snr_db']
+                        acc_low = sorted_data[i]['accuracy']
+                        acc_high = sorted_data[i + 1]['accuracy']
+                        
+                        degradation_rate = acc_high - acc_low
+                        degradation_per_db = degradation_rate / (snr_high - snr_low)
+                        
+                        if abs(degradation_per_db) < 0.5:
+                            classification = "Minimal"
+                        elif abs(degradation_per_db) < 1.5:
+                            classification = "Moderate"
+                        elif abs(degradation_per_db) < 3.0:
+                            classification = "Significant"
+                        else:
+                            classification = "Severe"
+                        
+                        writer.writerow([f"{snr_low} → {snr_high}", 
+                                       f"{degradation_rate:+.2f}", 
+                                       f"{degradation_per_db:+.2f}",
+                                       classification])
+                    writer.writerow([])
+                
+                # Confusion Matrix
+                writer.writerow(['Confusion Matrix'])
+                writer.writerow(['True Positives', self.true_positives])
+                writer.writerow(['False Positives', self.false_positives])
+                writer.writerow(['True Negatives', self.true_negatives])
+                writer.writerow(['False Negatives', self.false_negatives])
+                writer.writerow([])
                 
                 writer.writerow(['Prediction Metrics'])
                 writer.writerow(['Total Predictions', self.total_predictions])
@@ -4277,6 +4667,8 @@ WHY THIS PREDICTION?
             messagebox.showerror("Error", f"Failed to save model:\n{str(e)}")
     
     # ========== UTILITY METHODS ==========
+
+    
     
     def log_training(self, message):
         """Log message to training log"""

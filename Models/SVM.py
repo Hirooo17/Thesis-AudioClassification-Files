@@ -34,6 +34,8 @@ class SVMAudioClassifier:
         self.kernel = kernel
         self.C = C
         self.n_features_in_ = None  # Track expected feature count
+        self.scaler = None
+        self.normalized = False
         
     def compile(self, **kwargs):
         """Compile method for consistency with other models"""
@@ -270,16 +272,13 @@ class SVMAudioClassifier:
         
         return type('History', (), {'history': history})()
     
-    def predict(self, X_test):
-        """Full-featured prediction method with normalization and feature validation"""
+    def _prepare_features(self, X_test):
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions!")
-        
-        # If X_test is from a dataset batch, flatten it
+        if hasattr(X_test, 'numpy'):
+            X_test = X_test.numpy()
         if len(X_test.shape) > 2:
             X_test = X_test.reshape(X_test.shape[0], -1)
-        
-        # CRITICAL: Validate feature count matches training data
         if X_test.shape[1] != self.n_features_in_:
             raise ValueError(
                 f"❌ FEATURE MISMATCH ERROR!\n"
@@ -295,15 +294,25 @@ class SVMAudioClassifier:
                 f"   🔍 Prediction feature type: "
                 f"{'SPECTROGRAM' if X_test.shape[1] > 1000 else 'MFCC'}\n"
             )
-        
-        # Apply normalization if it was used during training
         if self.normalized and self.scaler is not None:
             X_test = self.scaler.transform(X_test)
-        
-        # Get prediction probabilities
+        return X_test
+
+    def predict_proba(self, X_test):
+        X_test = self._prepare_features(X_test)
         pred_proba = self.model.predict_proba(X_test)
-        # Return probability of positive class (class 1)
-        return pred_proba[:, 1].reshape(-1, 1)
+        if pred_proba.ndim == 1:
+            pred_proba = pred_proba.reshape(-1, 1)
+        if pred_proba.shape[1] == 1:
+            real = pred_proba[:, 0]
+            fake = 1 - real
+            pred_proba = np.stack([fake, real], axis=1)
+        return pred_proba
+
+    def predict(self, X_test):
+        probabilities = self.predict_proba(X_test)
+        real_probs = probabilities[:, 1]
+        return (real_probs >= 0.5).astype(int)
     
     def summary(self):
         """Print model summary with overfitting info"""

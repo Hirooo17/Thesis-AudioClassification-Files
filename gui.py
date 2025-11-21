@@ -15,6 +15,7 @@ import os
 import psutil
 import csv
 from matplotlib.backends.backend_pdf import PdfPages
+import librosa
 
 class AdvancedSimulationAudioGUI:
     def __init__(self, root, loaded_models=None, loaded_datasets=None):
@@ -60,6 +61,26 @@ class AdvancedSimulationAudioGUI:
         self.true_negatives = 0   # Predicted Fake, Actually Fake
         self.false_negatives = 0  # Predicted Fake, Actually Real
         
+        # Detailed classification report tracking
+        self.classification_report = {
+            'class_0': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0},
+            'class_1': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0},
+            'accuracy': 0,
+            'macro_avg': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0},
+            'weighted_avg': {'precision': 0, 'recall': 0, 'f1-score': 0, 'support': 0}
+        }
+        
+        # Training performance tracking
+        self.training_start_time = None
+        self.training_end_time = None
+        self.training_duration = 0
+        self.peak_memory_mb = 0
+        self.avg_memory_mb = 0
+        
+        # SNR degradation tracking
+        self.snr_degradation_data = []
+        self.current_snr_level = None
+        
         # Performance tracking
         self.performance_history = []
         self.real_time_metrics = {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1': 0}
@@ -79,6 +100,13 @@ class AdvancedSimulationAudioGUI:
         self.current_training_session = None
         self.training_hyperparameters = {}
         self.training_metrics = {}
+        self.explain_dataset_cache = {}
+        self.custom_audio_last_metrics = None
+        self.custom_audio_status = None
+        self.custom_model_status = None
+        self.model_combo = None
+        self.control_model_status = None
+        self.export_model_btn = None
 
         # Check available models and datasets from notebook
         self.populate_dropdowns_from_data()
@@ -452,11 +480,25 @@ class AdvancedSimulationAudioGUI:
         tk.Label(model_frame, text="🎯 Select Model:", font=('Arial', 14, 'bold'), 
                 bg='#34495e', fg='white').pack(anchor='w', pady=5)
         
-        model_combo = ttk.Combobox(model_frame, textvariable=self.selected_model,
-                                  values=list(self.available_models.keys()) if hasattr(self, 'available_models') else [],
-                                  state='readonly', width=40, font=('Arial', 12))
-        model_combo.pack(fill='x', pady=5)
-        model_combo.bind('<<ComboboxSelected>>', self.on_model_changed)
+        self.model_combo = ttk.Combobox(model_frame, textvariable=self.selected_model,
+                        values=list(self.available_models.keys()) if hasattr(self, 'available_models') else [],
+                        state='readonly', width=40, font=('Arial', 12))
+        self.model_combo.pack(fill='x', pady=5)
+        self.model_combo.bind('<<ComboboxSelected>>', self.on_model_changed)
+
+        import_btn_frame = tk.Frame(selection_frame, bg='#34495e')
+        import_btn_frame.pack(fill='x', pady=5)
+
+        tk.Button(import_btn_frame, text="📥 Import Model (.joblib/.pkl)",
+              command=self.import_custom_model_for_explainability,
+              bg='#1abc9c', fg='white', font=('Arial', 12, 'bold'),
+              relief='raised', bd=3).pack(anchor='w', pady=2)
+
+        self.control_model_status = tk.Label(import_btn_frame,
+                            text="No custom model imported",
+                            font=('Arial', 11, 'bold'),
+                            bg='#34495e', fg='#ecf0f1')
+        self.control_model_status.pack(anchor='w')
         
         # Dataset selection
         dataset_frame = tk.Frame(selection_frame, bg='#34495e')
@@ -763,9 +805,43 @@ class AdvancedSimulationAudioGUI:
                 # Flatten the sample for Random Forest
                 sample_flat = sample_x.reshape(1, -1)
                 
-                # Get prediction
-                pred_proba = self.model.predict(sample_flat)
-                confidence = float(pred_proba[0][0]) if pred_proba.shape[1] == 1 else float(pred_proba[0])
+                # Get probability-aware prediction with safe fallbacks
+                confidence = 0.0
+                real_probability = None
+                try:
+                    if hasattr(self.model, "predict_proba"):
+                        prob_output = self.model.predict_proba(sample_flat)
+                        prob_array = np.asarray(prob_output)
+                        if prob_array.ndim == 1:
+                            prob_array = prob_array.reshape(-1, 1)
+                        classes = getattr(self.model, "classes_", None)
+                        if prob_array.shape[1] == 1:
+                            real_probability = float(prob_array[0][0])
+                        elif classes is not None:
+                            classes_list = list(classes)
+                            if 1 in classes_list:
+                                class_index = classes_list.index(1)
+                                real_probability = float(prob_array[0][class_index])
+                            elif 0 in classes_list:
+                                class_index = classes_list.index(0)
+                                real_probability = 1.0 - float(prob_array[0][class_index])
+                            else:
+                                real_probability = float(prob_array[0][-1])
+                        else:
+                            # Default to last column when classes metadata is missing
+                            real_probability = float(prob_array[0][-1])
+                    else:
+                        predicted_raw = self.model.predict(sample_flat)
+                        real_probability = float(predicted_raw[0])
+                except Exception as prob_exc:
+                    self.root.after(0, lambda e=prob_exc: self.add_prediction_log(
+                        f"⚠️ Failed to compute prediction probabilities: {e}", "warning"))
+                    predicted_raw = self.model.predict(sample_flat)
+                    real_probability = 1.0 if float(predicted_raw[0]) >= 0.5 else 0.0
+                
+                if real_probability is None:
+                    real_probability = 0.0
+                confidence = max(0.0, min(1.0, real_probability))
                 predicted_label = 1 if confidence > 0.5 else 0
                 
                 # Determine if prediction is correct
@@ -820,6 +896,49 @@ class AdvancedSimulationAudioGUI:
                 
                 # Simulate processing time with speed control
                 time.sleep(0.5 / self.prediction_speed.get())
+                
+            # Generate detailed classification report
+            if len(self.prediction_history) > 0:
+                from sklearn.metrics import classification_report
+                y_true = [p['actual'] for p in self.prediction_history]
+                y_pred = [p['predicted'] for p in self.prediction_history]
+                
+                # Generate classification report
+                class_report = classification_report(y_true, y_pred, target_names=['Class 0 (Fake)', 'Class 1 (Real)'], output_dict=True, zero_division=0)
+                
+                # Store in our tracking structure
+                self.classification_report = {
+                    'class_0': {
+                        'precision': class_report['Class 0 (Fake)']['precision'],
+                        'recall': class_report['Class 0 (Fake)']['recall'],
+                        'f1-score': class_report['Class 0 (Fake)']['f1-score'],
+                        'support': class_report['Class 0 (Fake)']['support']
+                    },
+                    'class_1': {
+                        'precision': class_report['Class 1 (Real)']['precision'],
+                        'recall': class_report['Class 1 (Real)']['recall'],
+                        'f1-score': class_report['Class 1 (Real)']['f1-score'],
+                        'support': class_report['Class 1 (Real)']['support']
+                    },
+                    'accuracy': class_report['accuracy'],
+                    'macro_avg': {
+                        'precision': class_report['macro avg']['precision'],
+                        'recall': class_report['macro avg']['recall'],
+                        'f1-score': class_report['macro avg']['f1-score'],
+                        'support': class_report['macro avg']['support']
+                    },
+                    'weighted_avg': {
+                        'precision': class_report['weighted avg']['precision'],
+                        'recall': class_report['weighted avg']['recall'],
+                        'f1-score': class_report['weighted avg']['f1-score'],
+                        'support': class_report['weighted avg']['support']
+                    }
+                }
+                
+                # Log classification report
+                self.root.after(0, lambda: self.add_prediction_log("\n" + "="*60, "info"))
+                self.root.after(0, lambda: self.add_prediction_log("📊 DETAILED CLASSIFICATION REPORT", "info"))
+                self.root.after(0, lambda: self.add_prediction_log("="*60, "info"))
                 
             # Prediction complete
             if self.is_processing:
@@ -1445,6 +1564,13 @@ Final Accuracy: {accuracy:.2f}%
                                         height=2, width=25, relief='raised', bd=5,
                                         state='disabled')
         self.save_model_btn.pack(side='left', padx=10)
+
+        self.export_model_btn = tk.Button(control_frame, text="📤 EXPORT MODEL COPY", 
+                          command=self.export_trained_model_copy,
+                          bg='#9b59b6', fg='white', font=('Arial', 16, 'bold'),
+                          height=2, width=25, relief='raised', bd=5,
+                          state='disabled')
+        self.export_model_btn.pack(side='left', padx=10)
         
         # Training progress (now in scrollable area)
         progress_frame = tk.LabelFrame(self.training_content, text="📊 Training Progress", 
@@ -1503,6 +1629,10 @@ Final Accuracy: {accuracy:.2f}%
         self.is_processing = True
         self.train_btn.config(state='disabled', bg='#95a5a6')
         self.training_status.config(text="🔥 TRAINING IN PROGRESS", fg='#27ae60')
+        if self.save_model_btn is not None:
+            self.save_model_btn.config(state='disabled')
+        if self.export_model_btn is not None:
+            self.export_model_btn.config(state='disabled')
         
         self.training_log.delete(1.0, tk.END)
         self.add_training_log("🚀 Starting Training Session...", "info")
@@ -1659,26 +1789,38 @@ Final Accuracy: {accuracy:.2f}%
             
             # Initialize resource monitoring
             process = psutil.Process(os.getpid())
+            self.training_start_time = datetime.now()
             start_time = time.time()
             start_memory = process.memory_info().rss / (1024 * 1024)  # MB
+            peak_memory = start_memory
             
             self.root.after(0, lambda: self.add_training_log("📊 Resource Monitoring Started", "info"))
             self.root.after(0, lambda: self.add_training_log(f"   • Initial Memory: {start_memory:.2f} MB", "info"))
             
-            # Train the model
+            # Train the model (with periodic memory tracking)
             history = model.fit(train_dataset, validation_data=val_dataset)
             
+            # Track peak memory during training
+            current_memory = process.memory_info().rss / (1024 * 1024)
+            if current_memory > peak_memory:
+                peak_memory = current_memory
+            
             # Calculate resource usage
+            self.training_end_time = datetime.now()
             end_time = time.time()
             end_memory = process.memory_info().rss / (1024 * 1024)  # MB
             training_duration = end_time - start_time
+            self.training_duration = training_duration
             memory_used = end_memory - start_memory
+            self.peak_memory_mb = peak_memory
+            self.avg_memory_mb = (start_memory + end_memory) / 2
             cpu_percent = process.cpu_percent(interval=0.1)
             
             # Log resource metrics
             self.root.after(0, lambda: self.add_training_log("📊 Resource Usage Summary:", "success"))
             self.root.after(0, lambda: self.add_training_log(f"   ⏱️  Training Duration: {training_duration:.2f} seconds ({training_duration/60:.2f} minutes)", "info"))
-            self.root.after(0, lambda: self.add_training_log(f"   🧠 Memory Change: {memory_used:+.2f} MB (Peak: {end_memory:.2f} MB)", "info"))
+            self.root.after(0, lambda: self.add_training_log(f"   🧠 Memory Change: {memory_used:+.2f} MB", "info"))
+            self.root.after(0, lambda: self.add_training_log(f"   🧠 Peak Memory: {peak_memory:.2f} MB", "info"))
             self.root.after(0, lambda: self.add_training_log(f"   ⚡ CPU Usage: {cpu_percent:.1f}%", "info"))
             
             # Stop progress bar
@@ -1697,13 +1839,41 @@ Final Accuracy: {accuracy:.2f}%
             recall = history.history.get('recall', [0])[0] if 'recall' in history.history else 0
             f1 = history.history.get('f1_score', [0])[0] if 'f1_score' in history.history else 0
             
+            # Detect number of features from first batch
+            n_features = 0
+            train_samples = 0
+            val_samples = 0
+            
+            try:
+                for batch_x, _ in train_dataset.take(1):
+                    n_features = batch_x.shape[-1] if len(batch_x.shape) > 1 else batch_x.shape[0]
+                    
+                # Rough estimate of dataset sizes (to avoid slow unbatch operations)
+                train_samples = 3500  # Typical train size
+                val_samples = 750     # Typical val size
+            except:
+                n_features = 1
+                train_samples = 0
+                val_samples = 0
+            
             # ========== RECORD TRAINING SESSION ==========
             self.current_training_session = {
                 'model_type': model_type,
+                'start_time': self.training_start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'end_time': self.training_end_time.strftime('%Y-%m-%d %H:%M:%S'),
+                'train_dataset': train_dataset_name,
+                'val_dataset': val_dataset_name,
                 'dataset': f"{train_dataset_name} (train) + {val_dataset_name} (val)",
                 'feature_type': feature_type,
+                'train_samples': train_samples,
+                'val_samples': val_samples,
+                'n_features': n_features,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'duration': training_duration
+                'duration': training_duration,
+                'peak_memory_mb': peak_memory,
+                'avg_memory_mb': self.avg_memory_mb,
+                'memory_change_mb': memory_used,
+                'cpu_percent': cpu_percent
             }
             
             # Store hyperparameters based on model type
@@ -1731,15 +1901,24 @@ Final Accuracy: {accuracy:.2f}%
                     'learning_rate': xgb_lr
                 }
             
-            # Store metrics
+            # Attach hyperparameters to current session for exports
+            self.current_training_session['hyperparameters'] = self.training_hyperparameters.copy()
+
+            # Store metrics (keep as raw values 0-1, will convert to % in display)
             self.training_metrics = {
                 'train_accuracy': train_acc,
                 'val_accuracy': val_acc,
                 'precision': precision,
                 'recall': recall,
                 'f1_score': f1,
+                'val_precision': precision,
+                'val_recall': recall,
+                'val_f1': f1,
                 'training_time': training_duration
             }
+
+            # Attach metrics for export consumers that read from the session
+            self.current_training_session['metrics'] = self.training_metrics.copy()
             
             # Add to training history
             session_record = {
@@ -1764,6 +1943,8 @@ Final Accuracy: {accuracy:.2f}%
             
             # Enable save button and update status
             self.root.after(0, lambda: self.save_model_btn.config(state='normal'))
+            if self.export_model_btn is not None:
+                self.root.after(0, lambda: self.export_model_btn.config(state='normal'))
             self.root.after(0, lambda: self.training_status.config(text="✅ TRAINING COMPLETE", fg='#00ff88'))
             self.root.after(0, lambda: self.training_progress_label.config(text=f"Training Complete! Accuracy: {val_acc*100:.2f}%"))
             
@@ -1798,9 +1979,19 @@ Final Accuracy: {accuracy:.2f}%
             
             filepath = self.trained_model.save_model(filename)
             
+            # Store the saved filename in current training session
+            if self.current_training_session:
+                self.current_training_session['saved_filename'] = filename
+                # Update in training history as well
+                if self.training_history:
+                    self.training_history[-1]['saved_filename'] = filename
+            
             self.add_training_log(f"✅ Model saved successfully to {filepath}!", "success")
             self.add_training_log(f"📈 Training details available in 'Training Analysis' tab!", "info")
             messagebox.showinfo("Success", f"Model saved successfully!\n\nFile: {filepath}\n\n💡 View training details in the 'Training Analysis' tab!")
+            
+            # Update training results tab to show saved filename
+            self.update_training_results_tab()
             
             # Update the models dictionary with newly trained model
             self.models[self.train_model_type.get()] = self.trained_model
@@ -1811,6 +2002,35 @@ Final Accuracy: {accuracy:.2f}%
         except Exception as e:
             self.add_training_log(f"❌ Error saving model: {e}", "error")
             messagebox.showerror("Error", f"Failed to save model:\n{e}")
+
+    def export_trained_model_copy(self):
+        """Export a copy of the trained model without deleting other artifacts"""
+        if self.trained_model is None:
+            messagebox.showwarning("No Model", "Train a model before exporting a copy!")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_type = self.train_model_type.get().lower()
+        default_name = f"{model_type}_model_export_{timestamp}.joblib"
+
+        filepath = filedialog.asksaveasfilename(
+            title="Export trained model",
+            defaultextension=".joblib",
+            filetypes=[("Joblib", "*.joblib"), ("Pickle", "*.pkl"), ("All Files", "*.*")],
+            initialfile=default_name
+        )
+
+        if not filepath:
+            self.add_training_log("⚠️ Export cancelled by user", "warning")
+            return
+
+        try:
+            joblib.dump(self.trained_model, filepath)
+            self.add_training_log(f"📤 Exported documentation copy to {filepath}", "success")
+            messagebox.showinfo("Export Complete", f"Model copy saved to:\n{filepath}")
+        except Exception as exc:
+            self.add_training_log(f"❌ Error exporting model copy: {exc}", "error")
+            messagebox.showerror("Export Failed", f"Could not export model copy:\n{exc}")
         
     def create_monitoring_tab(self):
         """Create enhanced monitoring tab with SCROLLABLE container"""
@@ -2190,6 +2410,26 @@ Final Accuracy: {accuracy:.2f}%
         self.train_res_f1 = tk.Label(f1_frame, text="0.0%", 
                                      font=('Arial', 20, 'bold'), bg='#9b59b6', fg='white')
         self.train_res_f1.pack(pady=5)
+
+        # Resource usage row
+        resource_row = tk.Frame(metrics_frame, bg='#2c3e50')
+        resource_row.pack(fill='x', pady=5)
+
+        peak_frame = tk.Frame(resource_row, bg='#1abc9c', relief='raised', bd=2)
+        peak_frame.pack(side='left', fill='both', expand=True, padx=5)
+        tk.Label(peak_frame, text="🧠 Peak Memory", font=('Arial', 11, 'bold'),
+            bg='#1abc9c', fg='white').pack(pady=4)
+        self.train_res_peak_mem = tk.Label(peak_frame, text="0.00 MB",
+                          font=('Arial', 16, 'bold'), bg='#1abc9c', fg='white')
+        self.train_res_peak_mem.pack(pady=4)
+
+        avg_frame = tk.Frame(resource_row, bg='#16a085', relief='raised', bd=2)
+        avg_frame.pack(side='left', fill='both', expand=True, padx=5)
+        tk.Label(avg_frame, text="📉 Avg Memory", font=('Arial', 11, 'bold'),
+            bg='#16a085', fg='white').pack(pady=4)
+        self.train_res_avg_mem = tk.Label(avg_frame, text="0.00 MB",
+                          font=('Arial', 16, 'bold'), bg='#16a085', fg='white')
+        self.train_res_avg_mem.pack(pady=4)
         
         # Hyperparameters Display
         hyper_frame = tk.LabelFrame(current_frame, text="⚙️ Hyperparameters Used", 
@@ -2239,10 +2479,26 @@ Final Accuracy: {accuracy:.2f}%
         self.train_res_dataset.config(text=session.get('dataset', 'N/A'))
         
         # Update metrics (convert to percentage)
-        self.train_res_train_acc.config(text=f"{metrics.get('train_accuracy', 0)*100:.2f}%")
-        self.train_res_val_acc.config(text=f"{metrics.get('val_accuracy', 0)*100:.2f}%")
-        self.train_res_precision.config(text=f"{metrics.get('precision', 0)*100:.2f}%")
-        self.train_res_f1.config(text=f"{metrics.get('f1_score', 0)*100:.2f}%")
+        train_acc_val = metrics.get('train_accuracy', 0)
+        val_acc_val = metrics.get('val_accuracy', 0)
+        precision_val = metrics.get('precision', 0)
+        f1_val = metrics.get('f1_score', 0)
+        
+        # Handle both percentage (>1) and decimal (0-1) formats
+        train_acc_pct = train_acc_val if train_acc_val > 1 else train_acc_val * 100
+        val_acc_pct = val_acc_val if val_acc_val > 1 else val_acc_val * 100
+        precision_pct = precision_val if precision_val > 1 else precision_val * 100
+        f1_pct = f1_val if f1_val > 1 else f1_val * 100
+        
+        self.train_res_train_acc.config(text=f"{train_acc_pct:.2f}%")
+        self.train_res_val_acc.config(text=f"{val_acc_pct:.2f}%")
+        self.train_res_precision.config(text=f"{precision_pct:.2f}%")
+        self.train_res_f1.config(text=f"{f1_pct:.2f}%")
+
+        peak_mem = session.get('peak_memory_mb', 0)
+        avg_mem = session.get('avg_memory_mb', 0)
+        self.train_res_peak_mem.config(text=f"{peak_mem:.2f} MB")
+        self.train_res_avg_mem.config(text=f"{avg_mem:.2f} MB")
         
         # Update hyperparameters
         self.train_res_hyperparams.config(state='normal')
@@ -2286,8 +2542,15 @@ Final Accuracy: {accuracy:.2f}%
                 self.train_res_history.insert(tk.END, f"• Dataset             : {hist_session.get('dataset', 'N/A')}\n")
                 
                 hist_metrics = hist_session.get('metrics', {})
-                self.train_res_history.insert(tk.END, f"• Train Accuracy      : {hist_metrics.get('train_accuracy', 0)*100:.2f}%\n")
-                self.train_res_history.insert(tk.END, f"• Validation Accuracy : {hist_metrics.get('val_accuracy', 0)*100:.2f}%\n")
+                
+                # Handle both percentage and decimal formats
+                hist_train_acc = hist_metrics.get('train_accuracy', 0)
+                hist_val_acc = hist_metrics.get('val_accuracy', 0)
+                hist_train_pct = hist_train_acc if hist_train_acc > 1 else hist_train_acc * 100
+                hist_val_pct = hist_val_acc if hist_val_acc > 1 else hist_val_acc * 100
+                
+                self.train_res_history.insert(tk.END, f"• Train Accuracy      : {hist_train_pct:.2f}%\n")
+                self.train_res_history.insert(tk.END, f"• Validation Accuracy : {hist_val_pct:.2f}%\n")
                 self.train_res_history.insert(tk.END, f"• Training Duration   : {hist_session.get('duration', 0):.2f}s\n")
                 
                 # Show hyperparameters
@@ -2321,108 +2584,150 @@ Final Accuracy: {accuracy:.2f}%
                 return
             
             session = self.current_training_session
-            
-            with PdfPages(filename) as pdf:
-                # Page 1: Training Summary
-                fig = plt.figure(figsize=(11, 8.5))
-                fig.patch.set_facecolor('white')
-                ax = fig.add_subplot(111)
-                ax.axis('off')
-                
-                summary_text = []
-                summary_text.append("="*80)
-                summary_text.append("TRAINING SESSION REPORT")
-                summary_text.append("="*80)
-                summary_text.append("")
-                summary_text.append(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M:%S %p')}")
-                summary_text.append("")
-                summary_text.append("─"*80)
-                summary_text.append("MODEL INFORMATION")
-                summary_text.append("─"*80)
-                summary_text.append(f"Model Type:          {session.get('model_type', 'N/A')}")
-                summary_text.append(f"Training Started:    {session.get('start_time', 'N/A')[:19]}")
-                summary_text.append(f"Training Completed:  {session.get('end_time', 'N/A')[:19]}")
-                summary_text.append("")
-                
-                summary_text.append("─"*80)
-                summary_text.append("DATASET INFORMATION")
-                summary_text.append("─"*80)
-                summary_text.append(f"Training Dataset:    {session.get('train_dataset', 'N/A')}")
-                summary_text.append(f"Validation Dataset:  {session.get('val_dataset', 'N/A')}")
-                summary_text.append(f"Training Samples:    {session.get('train_samples', 'N/A')}")
-                summary_text.append(f"Validation Samples:  {session.get('val_samples', 'N/A')}")
-                summary_text.append(f"Number of Features:  {session.get('n_features', 'N/A')}")
-                summary_text.append("")
-                
-                summary_text.append("─"*80)
-                summary_text.append("PERFORMANCE METRICS")
-                summary_text.append("─"*80)
-                metrics = session.get('metrics', {})
-                summary_text.append(f"Training Accuracy:   {metrics.get('train_accuracy', 0):.2f}%")
-                summary_text.append(f"Validation Accuracy: {metrics.get('val_accuracy', 0):.2f}%")
-                summary_text.append(f"Precision:           {metrics.get('val_precision', 0):.2f}%")
-                summary_text.append(f"Recall:              {metrics.get('val_recall', 0):.2f}%")
-                summary_text.append(f"F1-Score:            {metrics.get('val_f1', 0):.2f}%")
-                summary_text.append(f"Training Time:       {metrics.get('training_time', 0):.2f} seconds")
-                summary_text.append("")
-                
-                summary_text.append("─"*80)
-                summary_text.append("HYPERPARAMETERS")
-                summary_text.append("─"*80)
-                hyperparams = session.get('hyperparameters', {})
-                for param, value in hyperparams.items():
-                    summary_text.append(f"{param:25s}: {value}")
-                
-                summary_text.append("")
-                summary_text.append("="*80)
-                
-                ax.text(0.05, 0.95, '\n'.join(summary_text), 
-                       transform=ax.transAxes,
-                       fontsize=10,
-                       verticalalignment='top',
-                       fontfamily='monospace')
-                
-                pdf.savefig(fig, bbox_inches='tight')
-                plt.close()
-                
-                # Page 2: Training History (if available)
-                if self.training_history:
+            session_metrics = session.get('metrics') or self.training_metrics or {}
+            session_hyperparams = session.get('hyperparameters') or self.training_hyperparameters or {}
+            session_metrics = session.get('metrics') or self.training_metrics or {}
+            session_hyperparams = session.get('hyperparameters') or self.training_hyperparameters or {}
+
+            with plt.rc_context({
+                'text.color': 'black',
+                'axes.edgecolor': 'black',
+                'axes.labelcolor': 'black',
+                'xtick.color': 'black',
+                'ytick.color': 'black',
+                'figure.facecolor': 'white',
+                'axes.facecolor': 'white'
+            }):
+                with PdfPages(filename) as pdf:
+                    # Page 1: Training Summary
                     fig = plt.figure(figsize=(11, 8.5))
                     fig.patch.set_facecolor('white')
                     ax = fig.add_subplot(111)
                     ax.axis('off')
-                    
-                    history_text = []
-                    history_text.append("="*80)
-                    history_text.append(f"TRAINING HISTORY - {len(self.training_history)} Session(s)")
-                    history_text.append("="*80)
-                    history_text.append("")
-                    
-                    for i, hist_session in enumerate(self.training_history, 1):
-                        history_text.append(f"{'─'*80}")
-                        history_text.append(f"Session #{i}")
-                        history_text.append(f"{'─'*80}")
-                        history_text.append(f"Model Type:          {hist_session.get('model_type', 'N/A')}")
-                        history_text.append(f"Training Time:       {hist_session.get('start_time', 'N/A')[:19]}")
-                        
-                        hist_metrics = hist_session.get('metrics', {})
-                        history_text.append(f"Train Accuracy:      {hist_metrics.get('train_accuracy', 0):.2f}%")
-                        history_text.append(f"Validation Accuracy: {hist_metrics.get('val_accuracy', 0):.2f}%")
-                        history_text.append(f"Training Duration:   {hist_metrics.get('training_time', 0):.2f}s")
-                        
-                        if 'saved_filename' in hist_session:
-                            history_text.append(f"Saved As:            {hist_session['saved_filename']}")
-                        
-                        history_text.append("")
-                    
-                    ax.text(0.05, 0.95, '\n'.join(history_text), 
-                           transform=ax.transAxes,
-                           fontsize=9,
-                           verticalalignment='top',
-                           fontfamily='monospace')
-                    
+
+                    summary_text = []
+                    summary_text.append("="*80)
+                    summary_text.append("TRAINING SESSION REPORT")
+                    summary_text.append("="*80)
+                    summary_text.append("")
+                    summary_text.append(f"Generated: {datetime.now().strftime('%B %d, %Y at %I:%M:%S %p')}")
+                    summary_text.append("")
+                    summary_text.append("─"*80)
+                    summary_text.append("MODEL INFORMATION")
+                    summary_text.append("─"*80)
+                    summary_text.append(f"Model Type:          {session.get('model_type', 'N/A')}")
+                    summary_text.append(f"Training Started:    {session.get('start_time', 'N/A')[:19]}")
+                    summary_text.append(f"Training Completed:  {session.get('end_time', 'N/A')[:19]}")
+                    summary_text.append("")
+
+                    summary_text.append("─"*80)
+                    summary_text.append("DATASET INFORMATION")
+                    summary_text.append("─"*80)
+                    summary_text.append(f"Training Dataset:    {session.get('train_dataset', 'N/A')}")
+                    summary_text.append(f"Validation Dataset:  {session.get('val_dataset', 'N/A')}")
+                    summary_text.append(f"Training Samples:    {session.get('train_samples', 'N/A')}")
+                    summary_text.append(f"Validation Samples:  {session.get('val_samples', 'N/A')}")
+                    summary_text.append(f"Number of Features:  {session.get('n_features', 'N/A')}")
+                    summary_text.append("")
+
+                    summary_text.append("─"*80)
+                    summary_text.append("PERFORMANCE METRICS")
+                    summary_text.append("─"*80)
+                    metrics = session_metrics
+
+                    # Handle both percentage and decimal formats
+                    train_acc = metrics.get('train_accuracy', 0)
+                    val_acc = metrics.get('val_accuracy', 0)
+                    precision = metrics.get('val_precision', 0) or metrics.get('precision', 0)
+                    recall = metrics.get('val_recall', 0) or metrics.get('recall', 0)
+                    f1 = metrics.get('val_f1', 0) or metrics.get('f1_score', 0)
+
+                    train_acc_pct = train_acc if train_acc > 1 else train_acc * 100
+                    val_acc_pct = val_acc if val_acc > 1 else val_acc * 100
+                    precision_pct = precision if precision > 1 else precision * 100
+                    recall_pct = recall if recall > 1 else recall * 100
+                    f1_pct = f1 if f1 > 1 else f1 * 100
+
+                    summary_text.append(f"Training Accuracy:   {train_acc_pct:.2f}%")
+                    summary_text.append(f"Validation Accuracy: {val_acc_pct:.2f}%")
+                    summary_text.append(f"Precision:           {precision_pct:.2f}%")
+                    summary_text.append(f"Recall:              {recall_pct:.2f}%")
+                    summary_text.append(f"F1-Score:            {f1_pct:.2f}%")
+                    summary_text.append(f"Training Time:       {metrics.get('training_time', 0):.2f} seconds")
+                    summary_text.append("")
+
+                    summary_text.append("─"*80)
+                    summary_text.append("RESOURCE UTILIZATION")
+                    summary_text.append("─"*80)
+                    summary_text.append(f"Peak Memory Usage:   {session.get('peak_memory_mb', 0):.2f} MB")
+                    summary_text.append(f"Average Memory Use:  {session.get('avg_memory_mb', 0):.2f} MB")
+                    summary_text.append(f"Memory Change:       {session.get('memory_change_mb', 0):+.2f} MB")
+                    summary_text.append(f"CPU Usage (avg):     {session.get('cpu_percent', 0):.1f}%")
+                    summary_text.append("")
+
+                    summary_text.append("─"*80)
+                    summary_text.append("HYPERPARAMETERS")
+                    summary_text.append("─"*80)
+                    for param, value in session_hyperparams.items():
+                        summary_text.append(f"{param:25s}: {value}")
+
+                    summary_text.append("")
+                    summary_text.append("="*80)
+
+                    ax.text(0.05, 0.95, '\n'.join(summary_text),
+                            transform=ax.transAxes,
+                            fontsize=10,
+                            verticalalignment='top',
+                            fontfamily='monospace')
+
                     pdf.savefig(fig, bbox_inches='tight')
                     plt.close()
+
+                    # Page 2: Training History (if available)
+                    if self.training_history:
+                        fig = plt.figure(figsize=(11, 8.5))
+                        fig.patch.set_facecolor('white')
+                        ax = fig.add_subplot(111)
+                        ax.axis('off')
+
+                        history_text = []
+                        history_text.append("="*80)
+                        history_text.append(f"TRAINING HISTORY - {len(self.training_history)} Session(s)")
+                        history_text.append("="*80)
+                        history_text.append("")
+
+                        for i, hist_session in enumerate(self.training_history, 1):
+                            history_text.append(f"{'─'*80}")
+                            history_text.append(f"Session #{i}")
+                            history_text.append(f"{'─'*80}")
+                            history_text.append(f"Model Type:          {hist_session.get('model_type', 'N/A')}")
+                            history_text.append(f"Training Time:       {hist_session.get('start_time', 'N/A')[:19]}")
+
+                            hist_metrics = hist_session.get('metrics', {})
+
+                            # Handle both percentage and decimal formats
+                            hist_train_acc = hist_metrics.get('train_accuracy', 0)
+                            hist_val_acc = hist_metrics.get('val_accuracy', 0)
+                            hist_train_pct = hist_train_acc if hist_train_acc > 1 else hist_train_acc * 100
+                            hist_val_pct = hist_val_acc if hist_val_acc > 1 else hist_val_acc * 100
+
+                            history_text.append(f"Train Accuracy:      {hist_train_pct:.2f}%")
+                            history_text.append(f"Validation Accuracy: {hist_val_pct:.2f}%")
+                            history_text.append(f"Training Duration:   {hist_metrics.get('training_time', 0):.2f}s")
+
+                            if 'saved_filename' in hist_session:
+                                history_text.append(f"Saved As:            {hist_session['saved_filename']}")
+
+                            history_text.append("")
+
+                        ax.text(0.05, 0.95, '\n'.join(history_text),
+                                transform=ax.transAxes,
+                                fontsize=9,
+                                verticalalignment='top',
+                                fontfamily='monospace')
+
+                        pdf.savefig(fig, bbox_inches='tight')
+                        plt.close()
             
             messagebox.showinfo("Success", f"Training report exported successfully to:\n{filename}")
             
@@ -2471,18 +2776,36 @@ Final Accuracy: {accuracy:.2f}%
                 writer.writerow([])
                 
                 writer.writerow(['PERFORMANCE METRICS'])
-                metrics = session.get('metrics', {})
-                writer.writerow(['Training Accuracy (%)', f"{metrics.get('train_accuracy', 0):.2f}"])
-                writer.writerow(['Validation Accuracy (%)', f"{metrics.get('val_accuracy', 0):.2f}"])
-                writer.writerow(['Precision (%)', f"{metrics.get('val_precision', 0):.2f}"])
-                writer.writerow(['Recall (%)', f"{metrics.get('val_recall', 0):.2f}"])
-                writer.writerow(['F1-Score (%)', f"{metrics.get('val_f1', 0):.2f}"])
+                metrics = session_metrics
+                
+                # Handle both percentage and decimal values
+                train_acc = metrics.get('train_accuracy', 0)
+                val_acc = metrics.get('val_accuracy', 0)
+                precision = metrics.get('val_precision', 0) or metrics.get('precision', 0)
+                recall = metrics.get('val_recall', 0) or metrics.get('recall', 0)
+                f1 = metrics.get('val_f1', 0) or metrics.get('f1_score', 0)
+                
+                # Convert to percentage if in decimal format
+                train_acc_pct = train_acc if train_acc > 1 else train_acc * 100
+                val_acc_pct = val_acc if val_acc > 1 else val_acc * 100
+                precision_pct = precision if precision > 1 else precision * 100
+                recall_pct = recall if recall > 1 else recall * 100
+                f1_pct = f1 if f1 > 1 else f1 * 100
+                
+                writer.writerow(['Training Accuracy (%)', f"{train_acc_pct:.2f}"])
+                writer.writerow(['Validation Accuracy (%)', f"{val_acc_pct:.2f}"])
+                writer.writerow(['Precision (%)', f"{precision_pct:.2f}"])
+                writer.writerow(['Recall (%)', f"{recall_pct:.2f}"])
+                writer.writerow(['F1-Score (%)', f"{f1_pct:.2f}"])
                 writer.writerow(['Training Time (seconds)', f"{metrics.get('training_time', 0):.2f}"])
+                writer.writerow(['Peak Memory (MB)', f"{session.get('peak_memory_mb', 0):.2f}"])
+                writer.writerow(['Average Memory (MB)', f"{session.get('avg_memory_mb', 0):.2f}"])
+                writer.writerow(['Memory Change (MB)', f"{session.get('memory_change_mb', 0):+.2f}"])
+                writer.writerow(['CPU Usage (%)', f"{session.get('cpu_percent', 0):.1f}"])
                 writer.writerow([])
                 
                 writer.writerow(['HYPERPARAMETERS'])
-                hyperparams = session.get('hyperparameters', {})
-                for param, value in hyperparams.items():
+                for param, value in session_hyperparams.items():
                     writer.writerow([param, value])
                 writer.writerow([])
                 
@@ -2494,13 +2817,20 @@ Final Accuracy: {accuracy:.2f}%
                     
                     for i, hist_session in enumerate(self.training_history, 1):
                         hist_metrics = hist_session.get('metrics', {})
+                        
+                        # Handle both percentage and decimal formats
+                        hist_train_acc = hist_metrics.get('train_accuracy', 0)
+                        hist_val_acc = hist_metrics.get('val_accuracy', 0)
+                        hist_train_pct = hist_train_acc if hist_train_acc > 1 else hist_train_acc * 100
+                        hist_val_pct = hist_val_acc if hist_val_acc > 1 else hist_val_acc * 100
+                        
                         writer.writerow([
                             i,
                             hist_session.get('model_type', 'N/A'),
-                            f"{hist_metrics.get('train_accuracy', 0):.2f}",
-                            f"{hist_metrics.get('val_accuracy', 0):.2f}",
+                            f"{hist_train_pct:.2f}",
+                            f"{hist_val_pct:.2f}",
                             f"{hist_metrics.get('training_time', 0):.2f}",
-                            hist_session.get('start_time', 'N/A'),
+                            hist_session.get('start_time', hist_session.get('timestamp', 'N/A')),
                             hist_session.get('saved_filename', 'Not saved')
                         ])
             
@@ -2771,15 +3101,52 @@ Final Accuracy: {accuracy:.2f}%
                  bg='#00d4ff', fg='black', font=('Arial', 12, 'bold'), 
                  cursor='hand2', padx=20, pady=10).pack(side='left', padx=10)
         
-        tk.Button(sample_row, text="📊 Show Global Feature Importance", 
-                 command=self.show_global_feature_importance,
-                 bg='#9b59b6', fg='white', font=('Arial', 12, 'bold'), 
-                 cursor='hand2', padx=20, pady=10).pack(side='left', padx=10)
-        
+        tk.Button(sample_row, text="📊 Show Global Feature Importance",
+                  command=self.show_global_feature_importance,
+                  bg='#9b59b6', fg='white', font=('Arial', 12, 'bold'),
+                  cursor='hand2', padx=20, pady=10).pack(side='left', padx=10)
+
         # Export button
         tk.Button(sample_row, text="📄 Export to PDF", command=self.export_explainability_pdf,
-                 bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'), 
-                 cursor='hand2', padx=20, pady=10).pack(side='left', padx=10)
+                  bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'),
+                  cursor='hand2', padx=20, pady=10).pack(side='left', padx=10)
+
+        custom_model_frame = tk.LabelFrame(control_panel, text="📦 Custom Model Loader",
+                                           font=('Arial', 14, 'bold'), bg='#2c3e50', fg='white',
+                                           padx=15, pady=10)
+        custom_model_frame.pack(fill='x', pady=5)
+
+        tk.Label(custom_model_frame,
+                 text="Import any joblib/pickle model and use it instantly for explainability runs",
+                 font=('Arial', 10), bg='#2c3e50', fg='#ecf0f1', anchor='w', justify='left').pack(fill='x', pady=5)
+
+        model_btns = tk.Frame(custom_model_frame, bg='#2c3e50')
+        model_btns.pack(fill='x', pady=2)
+
+        tk.Button(model_btns, text="📦 Import Custom Model", command=self.import_custom_model_for_explainability,
+                  bg='#ffd166', fg='black', font=('Arial', 12, 'bold'), cursor='hand2', padx=20, pady=8).pack(side='left', padx=5)
+
+        self.custom_model_status = tk.Label(custom_model_frame, text="No custom model loaded",
+                                            font=('Arial', 11, 'italic'), bg='#2c3e50', fg='#f39c12')
+        self.custom_model_status.pack(anchor='w', pady=5)
+
+        custom_audio_frame = tk.LabelFrame(control_panel, text="🎧 Custom Audio Explainability",
+                           font=('Arial', 14, 'bold'), bg='#2c3e50', fg='white',
+                           padx=15, pady=10)
+        custom_audio_frame.pack(fill='x', pady=5)
+
+        tk.Label(custom_audio_frame, text="Import any WAV/MP3 file and generate a real-time diagnosis using the currently selected model",
+             font=('Arial', 10), bg='#2c3e50', fg='#ecf0f1', anchor='w', justify='left').pack(fill='x', pady=5)
+
+        audio_btns = tk.Frame(custom_audio_frame, bg='#2c3e50')
+        audio_btns.pack(fill='x', pady=2)
+
+        tk.Button(audio_btns, text="🎧 Import Audio & Explain", command=self.import_audio_for_explainability,
+              bg='#00ff88', fg='black', font=('Arial', 12, 'bold'), cursor='hand2', padx=20, pady=8).pack(side='left', padx=5)
+
+        self.custom_audio_status = tk.Label(custom_audio_frame, text="No custom audio analyzed yet",
+                            font=('Arial', 11, 'italic'), bg='#2c3e50', fg='#f39c12')
+        self.custom_audio_status.pack(anchor='w', pady=5)
         
         # Prediction Summary
         summary_frame = tk.LabelFrame(self.explain_content, text="🎯 Prediction Summary", 
@@ -2821,187 +3188,486 @@ Final Accuracy: {accuracy:.2f}%
                                                      font=('Consolas', 10), wrap=tk.WORD)
         self.explain_log.pack(fill='both', expand=True, pady=5)
     
+    def _parse_dataset_selection(self, selection):
+        parts = selection.rsplit('_', 1)
+        if len(parts) == 2 and parts[0] in self.datasets:
+            if parts[1] in {'train', 'val', 'test'}:
+                return parts[0], parts[1]
+        return selection, None
+
+    def _infer_feature_type(self, dataset_entry, dataset_name):
+        info = {}
+        if isinstance(dataset_entry, dict):
+            info = dataset_entry.get('info', {}) or {}
+        feature_type = info.get('feature_type')
+        if not feature_type:
+            feature_type = 'mfcc' if dataset_name.startswith('mfcc_') else 'spectrogram'
+        return feature_type.lower(), info
+
+    def _get_dataset_split_arrays(self, selection):
+        dataset_name, split_hint = self._parse_dataset_selection(selection)
+        cache_key = (dataset_name, split_hint or 'auto')
+        if cache_key in self.explain_dataset_cache:
+            return self.explain_dataset_cache[cache_key]
+        if dataset_name not in self.datasets:
+            raise ValueError(f"Dataset '{dataset_name}' not found")
+        dataset_entry = self.datasets[dataset_name]
+        split_data, actual_split, info = self._resolve_dataset_split(dataset_entry, split_hint)
+        if split_data is None:
+            raise ValueError("Selected dataset has no data available for explainability")
+        X, y = self._convert_dataset_to_numpy(split_data)
+        feature_type, base_info = self._infer_feature_type(dataset_entry, dataset_name)
+        meta = {
+            'dataset_name': dataset_name,
+            'split': actual_split,
+            'feature_type': feature_type,
+            'info': {**(info or {}), **base_info},
+            'n_samples': len(X),
+            'n_features': X.shape[1] if len(X.shape) > 1 else len(X)
+        }
+        self.explain_dataset_cache[cache_key] = (X, y, meta)
+        return X, y, meta
+
+    def _resolve_dataset_split(self, dataset_entry, split_hint):
+        if isinstance(dataset_entry, dict):
+            info = dataset_entry.get('info', {})
+            candidates = [split_hint, 'test', 'val', 'train', None]
+            for candidate in candidates:
+                if candidate and candidate in dataset_entry and dataset_entry[candidate] is not None:
+                    return dataset_entry[candidate], candidate, info
+            return None, split_hint or 'unknown', info
+        return dataset_entry, split_hint or 'full', {}
+
+    def _convert_dataset_to_numpy(self, split_data):
+        if split_data is None:
+            return None, None
+        if isinstance(split_data, tuple) and len(split_data) == 2:
+            X, y = split_data
+            X = np.array(X)
+            y = np.array(y).reshape(-1)
+            X = X.reshape(X.shape[0], -1)
+            return X.astype(np.float32), y
+        if hasattr(split_data, 'unbatch'):
+            samples = []
+            labels = []
+            for batch_x, batch_y in split_data.unbatch():
+                features = batch_x.numpy() if hasattr(batch_x, 'numpy') else np.array(batch_x)
+                labels.append(int(batch_y.numpy() if hasattr(batch_y, 'numpy') else batch_y))
+                samples.append(features.flatten())
+            return np.array(samples, dtype=np.float32), np.array(labels)
+        if isinstance(split_data, list):
+            samples = [np.array(x).flatten() for x in split_data]
+            labels = np.zeros(len(samples))
+            return np.array(samples, dtype=np.float32), labels
+        raise ValueError("Unsupported dataset format for explainability")
+
+    def _get_model_attribute(self, attr_name):
+        if self.model is None:
+            return None
+        if hasattr(self.model, attr_name):
+            return getattr(self.model, attr_name)
+        inner_model = getattr(self.model, 'model', None)
+        if inner_model is not None and hasattr(inner_model, attr_name):
+            return getattr(inner_model, attr_name)
+        return None
+
+    def _analyze_audio_signal(self, audio, sr, file_path):
+        duration = len(audio) / sr if sr else 0.0
+        rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+        zcr = float(np.mean(librosa.feature.zero_crossing_rate(y=audio)[0])) if len(audio) else 0.0
+        centroid = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)[0])) if len(audio) else 0.0
+        bandwidth = float(np.mean(librosa.feature.spectral_bandwidth(y=audio, sr=sr)[0])) if len(audio) else 0.0
+        tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
+        harmonic, percussive = librosa.effects.hpss(audio)
+        signal_power = np.mean(np.square(audio)) + 1e-9
+        noise_power = np.mean(np.square(percussive)) + 1e-9
+        snr = 10 * np.log10(signal_power / noise_power)
+        dominant_freq = self._estimate_dominant_frequency(audio, sr)
+        return {
+            'file_name': os.path.basename(file_path),
+            'duration': duration,
+            'rms': rms,
+            'zcr': zcr,
+            'centroid': centroid,
+            'bandwidth': bandwidth,
+            'tempo': float(tempo),
+            'snr': snr,
+            'dominant_freq': dominant_freq
+        }
+
+    def _estimate_dominant_frequency(self, audio, sr):
+        if len(audio) == 0:
+            return 0.0
+        spectrum = np.abs(np.fft.rfft(audio))
+        if spectrum.size <= 1:
+            return 0.0
+        freqs = np.fft.rfftfreq(len(audio), d=1.0 / sr)
+        peak_idx = np.argmax(spectrum[1:]) + 1
+        if peak_idx >= len(freqs):
+            return 0.0
+        return float(freqs[peak_idx])
+
+    def _align_feature_vector(self, vector, expected_features):
+        if expected_features is None:
+            return vector
+        if len(vector) > expected_features:
+            return vector[:expected_features]
+        if len(vector) < expected_features:
+            return np.pad(vector, (0, expected_features - len(vector)), mode='constant')
+        return vector
+
+    def _extract_custom_audio_features(self, audio, sr, feature_type, expected_features=None):
+        feature_type = (feature_type or 'spectrogram').lower()
+        if feature_type == 'mfcc' or (expected_features and expected_features <= 128):
+            n_mfcc = 40 if expected_features is None else min(expected_features, 80)
+            mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=n_mfcc)
+            feature_vector = np.mean(mfcc, axis=1)
+        else:
+            mel_spec = librosa.feature.melspectrogram(
+                y=audio,
+                sr=sr,
+                n_fft=1024,
+                hop_length=256,
+                n_mels=128,
+                power=2.0
+            )
+            mel_db = librosa.power_to_db(mel_spec + 1e-9, ref=np.max)
+            if mel_db.shape[1] < 128:
+                mel_db = librosa.util.fix_length(mel_db, size=128, axis=1)
+            mel_db = mel_db[:, :128]
+            feature_vector = mel_db.flatten()
+        feature_vector = (feature_vector - np.mean(feature_vector)) / (np.std(feature_vector) + 1e-9)
+        feature_vector = self._align_feature_vector(feature_vector, expected_features)
+        return feature_vector.astype(np.float32)
+
     def analyze_sample_explainability(self):
-        """Analyze a specific sample and explain prediction"""
+        """Analyze a specific dataset sample and explain prediction"""
         if self.model is None:
             messagebox.showerror("Error", "Please select a model first!")
             return
-        
-        if not hasattr(self, 'datasets') or not self.datasets:
+        if not self.datasets:
             messagebox.showerror("Error", "No dataset loaded!")
             return
-        
         sample_idx = self.explain_sample_var.get()
-        dataset_name = self.selected_dataset.get()
-        
+        dataset_selection = self.selected_dataset.get()
         try:
-            self.explain_status.config(text="🔄 Analyzing sample...", fg='#f39c12')
-            self.explain_log.delete(1.0, tk.END)
-            self.explain_log.insert(tk.END, f"{'='*80}\n")
-            self.explain_log.insert(tk.END, f"🔍 EXPLAINABILITY ANALYSIS - Sample #{sample_idx}\n")
-            self.explain_log.insert(tk.END, f"{'='*80}\n\n")
-            
-            # Get dataset
-            if dataset_name not in self.datasets:
-                messagebox.showerror("Error", f"Dataset '{dataset_name}' not found!")
+            X_values, y_values, meta = self._get_dataset_split_arrays(dataset_selection)
+            if sample_idx < 0 or sample_idx >= len(X_values):
+                messagebox.showerror("Error", f"Sample {sample_idx} out of range (max: {len(X_values)-1})")
                 return
-            
-            X_test, y_test = self.datasets[dataset_name]
-            
-            if sample_idx >= len(X_test):
-                messagebox.showerror("Error", f"Sample {sample_idx} out of range (max: {len(X_test)-1})")
-                return
-            
-            # Get sample
-            sample = X_test[sample_idx:sample_idx+1]
-            true_label = y_test[sample_idx]
-            true_class = "REAL" if true_label == 1 else "FAKE"
-            
-            # Make prediction
-            self.explain_log.insert(tk.END, "🤖 Making prediction...\n")
-            
-            if hasattr(self.model, 'predict_proba'):
-                proba = self.model.predict_proba(sample)[0]
-                prediction = self.model.predict(sample)[0]
-                pred_class = "REAL" if prediction == 1 else "FAKE"
-                confidence = proba[1] if prediction == 1 else proba[0]
-                fake_prob = proba[0]
-                real_prob = proba[1]
-            else:
-                prediction = self.model.predict(sample)[0]
-                pred_class = "REAL" if prediction == 1 else "FAKE"
-                confidence = 0.0
-                fake_prob = 0.0
-                real_prob = 0.0
-            
-            is_correct = true_label == prediction
-            
-            # Update summary
-            self.explain_summary.delete(1.0, tk.END)
-            summary = f"""
-{'✅ CORRECT PREDICTION' if is_correct else '❌ INCORRECT PREDICTION'}
-
-📊 Sample Information:
-   • Sample Index: #{sample_idx}
-   • True Label: {true_class}
-   • Predicted Label: {pred_class}
-   • Confidence: {confidence*100:.2f}%
-
-🎯 Probability Breakdown:
-   • REAL probability: {real_prob*100:.2f}%
-   • FAKE probability: {fake_prob*100:.2f}%
-
-🤖 Model: {self.selected_model.get()}
-📁 Dataset: {dataset_name}
-"""
-            self.explain_summary.insert(1.0, summary)
-            
-            # Get feature importance
-            self.explain_log.insert(tk.END, "\n📊 Extracting feature importance...\n")
-            
-            if hasattr(self.model, 'feature_importances_'):
-                # Tree-based models (RF, XGBoost)
-                importances = self.model.feature_importances_
-                self.explain_log.insert(tk.END, f"   ✓ Found {len(importances)} feature importances\n")
-            else:
-                self.explain_log.insert(tk.END, "   ⚠️ Model doesn't support feature importance\n")
-                importances = None
-            
-            # Analyze sample features
-            self.explain_log.insert(tk.END, "\n🔍 Sample Feature Analysis:\n")
-            self.explain_log.insert(tk.END, f"   • Number of features: {sample.shape[1]}\n")
-            self.explain_log.insert(tk.END, f"   • Feature value range: [{sample.min():.4f}, {sample.max():.4f}]\n")
-            self.explain_log.insert(tk.END, f"   • Mean: {sample.mean():.4f}\n")
-            self.explain_log.insert(tk.END, f"   • Std: {sample.std():.4f}\n")
-            
-            # Find top contributing features
-            if importances is not None:
-                self.explain_log.insert(tk.END, "\n🌟 Top 20 Most Important Features:\n")
-                self.explain_log.insert(tk.END, "-" * 80 + "\n")
-                
-                top_indices = np.argsort(importances)[-20:][::-1]
-                for rank, idx in enumerate(top_indices, 1):
-                    feature_value = sample[0, idx]
-                    importance = importances[idx]
-                    self.explain_log.insert(tk.END, 
-                        f"   {rank:2d}. Feature #{idx:3d}: "
-                        f"Importance={importance:.6f} | Value={feature_value:.4f}\n")
-            
-            # Decision explanation
-            self.explain_log.insert(tk.END, f"\n{'='*80}\n")
-            self.explain_log.insert(tk.END, "💡 WHY THIS PREDICTION?\n")
-            self.explain_log.insert(tk.END, f"{'='*80}\n\n")
-            
-            if hasattr(self.model, 'predict_proba'):
-                self.explain_log.insert(tk.END, f"1. PROBABILITY ANALYSIS:\n")
-                self.explain_log.insert(tk.END, f"   • Model calculated {real_prob*100:.2f}% probability for REAL\n")
-                self.explain_log.insert(tk.END, f"   • Model calculated {fake_prob*100:.2f}% probability for FAKE\n")
-                self.explain_log.insert(tk.END, f"   • Decision threshold: 50%\n")
-                self.explain_log.insert(tk.END, f"   • Final prediction: {pred_class} (higher probability)\n\n")
-            
-            if importances is not None:
-                self.explain_log.insert(tk.END, f"2. FEATURE-BASED REASONING:\n")
-                top_5 = np.argsort(importances)[-5:][::-1]
-                self.explain_log.insert(tk.END, f"   The model focused on these top 5 features:\n")
-                for i, idx in enumerate(top_5, 1):
-                    self.explain_log.insert(tk.END, 
-                        f"   {i}. Feature #{idx} (importance: {importances[idx]:.4f}, "
-                        f"value: {sample[0, idx]:.4f})\n")
-                self.explain_log.insert(tk.END, "\n")
-            
-            self.explain_log.insert(tk.END, f"3. CONFIDENCE ASSESSMENT:\n")
-            if confidence > 0.9:
-                level = "VERY HIGH - Model is very certain"
-            elif confidence > 0.8:
-                level = "HIGH - Model is confident"
-            elif confidence > 0.7:
-                level = "GOOD - Model has good confidence"
-            elif confidence > 0.6:
-                level = "MODERATE - Model has moderate confidence"
-            else:
-                level = "LOW - Model is uncertain"
-            self.explain_log.insert(tk.END, f"   • Confidence: {confidence*100:.2f}%\n")
-            self.explain_log.insert(tk.END, f"   • Level: {level}\n\n")
-            
-            self.explain_log.insert(tk.END, f"4. GROUND TRUTH COMPARISON:\n")
-            self.explain_log.insert(tk.END, f"   • True Label: {true_class}\n")
-            self.explain_log.insert(tk.END, f"   • Predicted: {pred_class}\n")
-            self.explain_log.insert(tk.END, f"   • Result: {'✅ CORRECT' if is_correct else '❌ INCORRECT'}\n")
-            
-            if not is_correct:
-                self.explain_log.insert(tk.END, f"\n   ⚠️ MISCLASSIFICATION ANALYSIS:\n")
-                self.explain_log.insert(tk.END, f"   • Model detected features more similar to {pred_class}\n")
-                self.explain_log.insert(tk.END, f"   • Confidence: {'HIGH' if confidence > 0.7 else 'MODERATE'}\n")
-                self.explain_log.insert(tk.END, f"   • Possible reasons: Edge case, ambiguous features, or noise\n")
-            
-            # Create visualizations
-            self.create_explainability_visualizations(
-                sample, importances, true_class, pred_class, confidence, 
-                fake_prob, real_prob, is_correct)
-            
-            # Store in history
-            self.explainability_data.append({
-                'sample_idx': sample_idx,
-                'true_label': true_class,
-                'predicted_label': pred_class,
-                'confidence': confidence,
-                'fake_prob': fake_prob,
-                'real_prob': real_prob,
-                'importances': importances,
-                'sample_values': sample[0] if importances is not None else None,
-                'is_correct': is_correct
-            })
-            
-            self.explain_status.config(
-                text=f"✅ Analysis complete! Predicted: {pred_class} ({confidence*100:.1f}%)", 
-                fg='#00ff88')
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to analyze sample:\n{str(e)}")
+            sample_vector = X_values[sample_idx]
+            true_label = y_values[sample_idx]
+            self._run_explainability_analysis(sample_vector, meta, sample_idx=sample_idx,
+                                              true_label=true_label, source='dataset_sample',
+                                              audio_meta=None)
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to analyze sample:\n{exc}")
             self.explain_status.config(text="❌ Analysis failed", fg='#e74c3c')
-            import traceback
-            traceback.print_exc()
     
+    def _run_explainability_analysis(self, sample_vector, meta, sample_idx=None,
+                                     true_label=None, source='dataset_sample', audio_meta=None):
+        self.explain_status.config(text="🔄 Running explainability...", fg='#f39c12')
+        self.explain_log.delete(1.0, tk.END)
+        sample_np = np.array(sample_vector)
+        if sample_np.ndim == 1:
+            sample_np = sample_np.reshape(1, -1)
+        else:
+            sample_np = sample_np.reshape(sample_np.shape[0], -1)
+        expected_features = getattr(self.model, 'n_features_in_', None)
+        shape_note = ""
+        if expected_features and sample_np.shape[1] != expected_features:
+            original = sample_np.shape[1]
+            if sample_np.shape[1] > expected_features:
+                sample_np = sample_np[:, :expected_features]
+                shape_note = f"Trimmed feature vector from {original} to {expected_features} features"
+            else:
+                pad_width = expected_features - sample_np.shape[1]
+                sample_np = np.pad(sample_np, ((0, 0), (0, pad_width)), mode='constant')
+                shape_note = f"Zero-padded feature vector from {original} to {expected_features} features"
+        true_class = "UNKNOWN" if true_label is None else ("REAL" if int(true_label) == 1 else "FAKE")
+        self.explain_log.insert(tk.END, f"{'='*80}\n")
+        header = "🔍 CUSTOM AUDIO ANALYSIS" if source == 'custom_audio' else f"🔍 EXPLAINABILITY ANALYSIS - Sample #{sample_idx}"
+        self.explain_log.insert(tk.END, f"{header}\n")
+        self.explain_log.insert(tk.END, f"{'='*80}\n\n")
+        if shape_note:
+            self.explain_log.insert(tk.END, f"⚙️ {shape_note}\n\n")
+        fake_prob = 0.0
+        real_prob = 0.0
+        confidence = 0.0
+        prediction = 0
+        predict_proba_fn = self._get_model_attribute('predict_proba')
+        probabilities = None
+        if callable(predict_proba_fn):
+            try:
+                probabilities = np.array(predict_proba_fn(sample_np))
+            except Exception as prob_exc:
+                self.explain_log.insert(tk.END, f"⚠️ predict_proba failed ({prob_exc}); falling back to predict()\n\n")
+                probabilities = None
+        if probabilities is not None:
+            if probabilities.ndim == 1:
+                probabilities = probabilities.reshape(1, -1)
+            prob_vector = probabilities[0]
+            if prob_vector.size >= 2:
+                fake_prob = float(prob_vector[0])
+                real_prob = float(prob_vector[1])
+            else:
+                real_prob = float(prob_vector[0])
+                fake_prob = float(1.0 - real_prob)
+            prediction = 1 if real_prob >= fake_prob else 0
+            confidence = real_prob if prediction == 1 else fake_prob
+        else:
+            predict_fn = self._get_model_attribute('predict')
+            if not callable(predict_fn):
+                raise ValueError("Selected model does not implement a compatible predict method.")
+            raw_outputs = np.array(predict_fn(sample_np)).reshape(-1)
+            first_value = float(raw_outputs[0])
+            if 0.0 <= first_value <= 1.0:
+                real_prob = first_value
+                fake_prob = 1.0 - real_prob
+                prediction = 1 if real_prob >= 0.5 else 0
+                confidence = real_prob if prediction == 1 else fake_prob
+            else:
+                prediction = 1 if first_value >= 0.5 else 0
+                real_prob = 1.0 if prediction == 1 else 0.0
+                fake_prob = 1.0 - real_prob
+                confidence = 1.0
+            fake_prob = float(np.clip(fake_prob, 0.0, 1.0))
+            real_prob = float(np.clip(real_prob, 0.0, 1.0))
+            confidence = float(np.clip(confidence, 0.0, 1.0))
+        pred_class = "REAL" if prediction == 1 else "FAKE"
+        is_correct = None if true_label is None else (int(true_label) == prediction)
+        if is_correct is True:
+            result_header = "✅ MATCHED GROUND TRUTH"
+        elif is_correct is False:
+            result_header = "❌ MISMATCH VS GROUND TRUTH"
+        else:
+            result_header = "🔎 MODEL DIAGNOSIS"
+        summary_lines = [result_header, "", "📊 Sample Information:"]
+        if sample_idx is not None:
+            summary_lines.append(f"   • Sample Index: #{sample_idx}")
+        summary_lines.append(f"   • True Label: {true_class}")
+        summary_lines.append(f"   • Predicted Label: {pred_class}")
+        summary_lines.append(f"   • Confidence: {confidence*100:.2f}%")
+        summary_lines.append("")
+        summary_lines.append("🎯 Probability Breakdown:")
+        summary_lines.append(f"   • REAL probability: {real_prob*100:.2f}%")
+        summary_lines.append(f"   • FAKE probability: {fake_prob*100:.2f}%")
+        summary_lines.append("")
+        summary_lines.append(f"🤖 Model: {self.selected_model.get()}")
+        summary_lines.append(f"📁 Dataset Context: {meta.get('dataset_name', 'N/A')} ({meta.get('split', 'custom')})")
+        if audio_meta:
+            summary_lines.append("")
+            summary_lines.append("🎧 Audio Diagnostics:")
+            summary_lines.append(f"   • File: {audio_meta.get('file_name', 'Unknown')}")
+            summary_lines.append(f"   • Duration: {audio_meta.get('duration', 0):.2f}s")
+            summary_lines.append(f"   • RMS Energy: {audio_meta.get('rms', 0):.4f}")
+            summary_lines.append(f"   • Zero-Crossing Rate: {audio_meta.get('zcr', 0):.4f}")
+            summary_lines.append(f"   • Spectral Centroid: {audio_meta.get('centroid', 0):.1f} Hz")
+            summary_lines.append(f"   • Estimated SNR: {audio_meta.get('snr', 0):.2f} dB")
+        self.explain_summary.delete(1.0, tk.END)
+        self.explain_summary.insert(1.0, "\n".join(summary_lines))
+        importances = self._get_model_attribute('feature_importances_')
+        if importances is not None:
+            importances = np.array(importances)
+        sample_stats = sample_np[0]
+        self.explain_log.insert(tk.END, "📊 Sample Feature Analysis:\n")
+        self.explain_log.insert(tk.END, f"   • Feature count: {sample_np.shape[1]}\n")
+        self.explain_log.insert(tk.END, f"   • Range: [{sample_stats.min():.4f}, {sample_stats.max():.4f}]\n")
+        self.explain_log.insert(tk.END, f"   • Mean: {sample_stats.mean():.4f}\n")
+        self.explain_log.insert(tk.END, f"   • Std: {sample_stats.std():.4f}\n")
+        if audio_meta:
+            self.explain_log.insert(tk.END, "\n🎧 Real-Time Audio Analysis:\n")
+            self.explain_log.insert(tk.END, f"   • Dominant Frequency: {audio_meta.get('dominant_freq', 0):.1f} Hz\n")
+            self.explain_log.insert(tk.END, f"   • Spectral Bandwidth: {audio_meta.get('bandwidth', 0):.1f} Hz\n")
+            self.explain_log.insert(tk.END, f"   • Beat Tempo: {audio_meta.get('tempo', 0):.1f} BPM\n")
+        if importances is not None:
+            self.explain_log.insert(tk.END, "\n🌟 Top 20 Most Influential Features:\n")
+            self.explain_log.insert(tk.END, "-" * 80 + "\n")
+            top_indices = np.argsort(importances)[-20:][::-1]
+            for rank, idx in enumerate(top_indices, 1):
+                if idx < len(sample_stats):
+                    feature_value = sample_stats[idx]
+                else:
+                    feature_value = 0.0
+                self.explain_log.insert(tk.END,
+                    f"   {rank:2d}. Feature #{idx:4d} — Importance={importances[idx]:.6f} | Value={feature_value:.4f}\n")
+        else:
+            self.explain_log.insert(tk.END, "\n⚠️ This model does not expose per-feature importance.\n")
+        self.explain_log.insert(tk.END, f"\n{'='*80}\n💡 WHY THIS PREDICTION?\n{'='*80}\n\n")
+        has_prob_view = callable(predict_proba_fn) or (0.0 < real_prob < 1.0 and 0.0 < fake_prob < 1.0)
+        if has_prob_view:
+            self.explain_log.insert(tk.END, "1. Probability Perspective:\n")
+            self.explain_log.insert(tk.END, f"   • REAL probability: {real_prob*100:.2f}%\n")
+            self.explain_log.insert(tk.END, f"   • FAKE probability: {fake_prob*100:.2f}%\n")
+            self.explain_log.insert(tk.END, f"   • Decision Threshold: 50%\n")
+            self.explain_log.insert(tk.END, f"   • Final Decision: {pred_class}\n\n")
+        if importances is not None:
+            self.explain_log.insert(tk.END, "2. Feature-Based Reasoning:\n")
+            top_local = np.argsort(importances)[-5:][::-1]
+            for i, idx in enumerate(top_local, 1):
+                value = sample_stats[idx] if idx < len(sample_stats) else 0.0
+                self.explain_log.insert(tk.END,
+                    f"   {i}. Feature #{idx} — importance {importances[idx]:.4f}, value {value:.4f}\n")
+            self.explain_log.insert(tk.END, "\n")
+        level = "VERY HIGH" if confidence > 0.9 else "HIGH" if confidence > 0.8 else "GOOD" if confidence > 0.7 else "MODERATE" if confidence > 0.6 else "LOW"
+        self.explain_log.insert(tk.END, "3. Confidence Assessment:\n")
+        self.explain_log.insert(tk.END, f"   • Confidence: {confidence*100:.2f}% ({level})\n\n")
+        self.explain_log.insert(tk.END, "4. Ground Truth Comparison:\n")
+        self.explain_log.insert(tk.END, f"   • True Label: {true_class}\n")
+        self.explain_log.insert(tk.END, f"   • Predicted: {pred_class}\n")
+        result_text = "N/A (custom audio)" if is_correct is None else ('✅ CORRECT' if is_correct else '❌ INCORRECT')
+        self.explain_log.insert(tk.END, f"   • Result: {result_text}\n")
+        if is_correct is False:
+            self.explain_log.insert(tk.END, "\n   ⚠️ Possible misclassification reasons: ambiguous cues, overlapping spectra, or noise spikes.\n")
+        self.create_explainability_visualizations(
+            sample_np, importances, true_class, pred_class, confidence,
+            fake_prob, real_prob, is_correct if is_correct is not None else False)
+        self.explainability_data.append({
+            'sample_idx': sample_idx if sample_idx is not None else 'custom_audio',
+            'true_label': true_class,
+            'predicted_label': pred_class,
+            'confidence': confidence,
+            'fake_prob': fake_prob,
+            'real_prob': real_prob,
+            'importances': importances,
+            'sample_values': sample_np[0] if importances is not None else None,
+            'is_correct': is_correct,
+            'source': source,
+            'audio_meta': audio_meta
+        })
+        status_text = f"✅ Custom audio diagnosed as {pred_class} ({confidence*100:.1f}%)" if source == 'custom_audio' else f"✅ Sample #{sample_idx} predicted {pred_class} ({confidence*100:.1f}%)"
+        status_color = '#00ff88'
+        self.explain_status.config(text=status_text, fg=status_color)
+
+    def import_custom_model_for_explainability(self):
+        file_path = filedialog.askopenfilename(
+            title="Select model file",
+            filetypes=[
+                ("Model Files", "*.joblib *.pkl"),
+                ("Joblib", "*.joblib"),
+                ("Pickle", "*.pkl"),
+                ("All Files", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+        loaded_model = None
+        load_error = None
+        try:
+            loaded_model = joblib.load(file_path)
+        except Exception as joblib_error:
+            load_error = joblib_error
+            try:
+                with open(file_path, 'rb') as handle:
+                    loaded_model = pickle.load(handle)
+                    load_error = None
+            except Exception as pickle_error:
+                load_error = pickle_error
+        if loaded_model is None:
+            messagebox.showerror("Import Error", f"Failed to load model:\n{load_error}")
+            return
+        if not hasattr(loaded_model, 'predict') and not hasattr(getattr(loaded_model, 'model', None), 'predict'):
+            messagebox.showerror("Import Error", "The selected file does not contain a compatible model (missing predict method).")
+            return
+        model_name = os.path.splitext(os.path.basename(file_path))[0]
+        base_name = model_name
+        suffix = 1
+        while model_name in self.models:
+            model_name = f"{base_name}_{suffix}"
+            suffix += 1
+        self.models[model_name] = loaded_model
+        status_flag = "✅ Imported" if getattr(loaded_model, 'is_fitted', True) else "⚠️ Imported (not trained)"
+        self.available_models[model_name] = f"{model_name} - {status_flag}"
+        self.selected_model.set(model_name)
+        self.model = loaded_model
+        if self.model_combo is not None:
+            self.model_combo['values'] = list(self.available_models.keys())
+            self.model_combo.set(model_name)
+        if self.custom_model_status is not None:
+            self.custom_model_status.config(text=f"Active model: {model_name}", fg='#00ff88')
+        if self.control_model_status is not None:
+            self.control_model_status.config(text=f"Loaded model: {model_name}", fg='#00ff88')
+        self.explain_status.config(text=f"✅ Custom model '{model_name}' loaded", fg='#00ff88')
+        messagebox.showinfo("Model Imported", f"Successfully loaded custom model:\n{model_name}")
+
+    def import_audio_for_explainability(self):
+        if self.model is None:
+            messagebox.showerror("Error", "Please select and load a model before importing audio.")
+            return
+        file_path = filedialog.askopenfilename(
+            title="Select audio file",
+            filetypes=[
+                ("Audio Files", "*.wav *.mp3 *.flac *.ogg"),
+                ("All Files", "*.*")
+            ]
+        )
+        if not file_path:
+            return
+        dataset_selection = self.selected_dataset.get()
+        dataset_name, _ = self._parse_dataset_selection(dataset_selection)
+        dataset_entry = self.datasets.get(dataset_name)
+        feature_type, info = self._infer_feature_type(dataset_entry, dataset_name) if dataset_entry else ('spectrogram', {})
+        expected_features = getattr(self.model, 'n_features_in_', None)
+        self._set_custom_audio_status("Analyzing custom audio...", '#f39c12')
+        self.explain_status.config(text="Analyzing custom audio...", fg='#f39c12')
+
+        threading.Thread(
+            target=self._process_custom_audio_file,
+            args=(file_path, dataset_name, feature_type, info or {}, expected_features),
+            daemon=True
+        ).start()
+
+    def _process_custom_audio_file(self, file_path, dataset_name, feature_type, info, expected_features):
+        try:
+            audio, sr = librosa.load(file_path, sr=16000, mono=True)
+            feature_vector = self._extract_custom_audio_features(audio, sr, feature_type, expected_features)
+            audio_meta = self._analyze_audio_signal(audio, sr, file_path)
+            meta = {
+                'dataset_name': dataset_name or 'custom_audio',
+                'split': 'custom_audio',
+                'feature_type': feature_type,
+                'info': info,
+                'n_samples': 1,
+                'n_features': len(feature_vector)
+            }
+        except Exception as exc:
+            self.root.after(0, lambda: self._handle_custom_audio_failure(exc))
+            return
+
+        self.root.after(0, lambda: self._finalize_custom_audio_analysis(file_path, feature_vector, meta, audio_meta))
+
+    def _finalize_custom_audio_analysis(self, file_path, feature_vector, meta, audio_meta):
+        try:
+            self._run_explainability_analysis(
+                feature_vector,
+                meta,
+                sample_idx=None,
+                true_label=None,
+                source='custom_audio',
+                audio_meta=audio_meta
+            )
+        except Exception as exc:
+            self._handle_custom_audio_failure(exc)
+            return
+
+        self.custom_audio_last_metrics = audio_meta
+        latest = self.explainability_data[-1] if self.explainability_data else None
+        if latest is not None:
+            label_text = f"Custom audio: {os.path.basename(file_path)} → {latest['predicted_label']} ({latest['confidence']*100:.1f}%)"
+        else:
+            label_text = "Custom audio analyzed"
+        self._set_custom_audio_status(label_text, '#00ff88')
+        self.explain_status.config(text="Custom audio analysis complete", fg='#00ff88')
+
+    def _handle_custom_audio_failure(self, exc):
+        messagebox.showerror("Error", f"Failed to analyze audio file:\n{exc}")
+        self._set_custom_audio_status("Custom audio analysis failed", '#e74c3c')
+        self.explain_status.config(text="Custom audio analysis failed", fg='#e74c3c')
+
+    def _set_custom_audio_status(self, text, color='#ecf0f1'):
+        if self.custom_audio_status is not None:
+            self.custom_audio_status.config(text=text, fg=color)
+
     def show_global_feature_importance(self):
         """Show global feature importance for the entire model"""
         if self.model is None:
@@ -3143,7 +3809,7 @@ across all predictions in the training data.
         self.dist_ax.axis('off')
         
         result_color = '#27ae60' if is_correct else '#e74c3c'
-        result_text = '✅ CORRECT' if is_correct else '❌ INCORRECT'
+        result_text = 'CORRECT' if is_correct else 'INCORRECT'
         
         summary_text = f"""
 {result_text}
@@ -3214,18 +3880,15 @@ Model: {self.selected_model.get()}
         top_10_contribution = importances[np.argsort(importances)[-10:]].sum() / importances.sum() * 100
         top_30_contribution = importances[np.argsort(importances)[-30:]].sum() / importances.sum() * 100
         
-        stats_text = f"""
-📊 IMPORTANCE STATISTICS
-
-Total Features: {len(importances)}
-
-Top 10: {top_10_contribution:.1f}%
-Top 30: {top_30_contribution:.1f}%
-
-Max: {importances.max():.4f}
-Mean: {importances.mean():.4f}
-Min: {importances.min():.4f}
-"""
+        stats_text = (
+            "IMPORTANCE STATISTICS\n\n"
+            f"Total Features: {len(importances)}\n\n"
+            f"Top 10 Contribution: {top_10_contribution:.1f}%\n"
+            f"Top 30 Contribution: {top_30_contribution:.1f}%\n\n"
+            f"Max: {importances.max():.4f}\n"
+            f"Mean: {importances.mean():.4f}\n"
+            f"Min: {importances.min():.4f}"
+        )
         
         self.dist_ax.text(0.5, 0.5, stats_text, ha='center', va='center', 
                          color='white', fontsize=12, family='monospace',
@@ -3258,19 +3921,24 @@ Min: {importances.min():.4f}
                 fig.patch.set_facecolor('white')
                 ax = fig.add_subplot(111)
                 ax.axis('off')
-                
-                ax.text(0.5, 0.7, '🔍 TREE MODEL EXPLAINABILITY REPORT\n\nDetailed Prediction Analysis',
-                       ha='center', va='center', fontsize=22, weight='bold', family='monospace')
-                
-                info = f"""
-Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Total Samples Analyzed: {len(self.explainability_data)}
-Model: {self.selected_model.get()}
-Dataset: {self.selected_dataset.get()}
-Task: Real vs Fake Audio Detection
-"""
+
+                ax.text(
+                    0.5,
+                    0.7,
+                    'TREE MODEL EXPLAINABILITY REPORT\n\nDetailed Prediction Analysis',
+                    ha='center', va='center', fontsize=22, weight='bold', family='monospace'
+                )
+
+                info = (
+                    f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"Total Samples Analyzed: {len(self.explainability_data)}\n"
+                    f"Model: {self.selected_model.get()}\n"
+                    f"Dataset: {self.selected_dataset.get()}\n"
+                    "Task: Real vs Fake Audio Detection\n"
+                )
+
                 ax.text(0.5, 0.3, info, ha='center', va='center', fontsize=11, family='monospace')
-                
+
                 pdf.savefig(fig, bbox_inches='tight')
                 plt.close()
                 
@@ -3286,7 +3954,7 @@ Task: Real vs Fake Audio Detection
                     ax_info = fig.add_subplot(gs[0, :])
                     ax_info.axis('off')
                     
-                    result = "CORRECT ✓" if data['is_correct'] else "INCORRECT ✗"
+                    result = "CORRECT" if data['is_correct'] else "INCORRECT"
                     info_text = f"""
 PREDICTION RESULT: {result}
 
@@ -3347,7 +4015,7 @@ WHY THIS PREDICTION?
 4. GROUND TRUTH:
    • True Label: {data['true_label']}
    • Predicted: {data['predicted_label']}
-   • Result: {'CORRECT ✓' if data['is_correct'] else 'INCORRECT ✗'}
+    • Result: {'CORRECT' if data['is_correct'] else 'INCORRECT'}
    {f'• Error likely due to ambiguous features or edge case' if not data['is_correct'] else ''}
 
 5. MODEL DETAILS:
@@ -3483,26 +4151,24 @@ Date: {report_date}
                 else:
                     f1 = 0
                 
-                metrics_info = f"""
-PERFORMANCE METRICS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✓ Correct: {self.correct_predictions}
-✗ Incorrect: {self.total_predictions - self.correct_predictions}
-🎯 Accuracy: {accuracy:.2f}%
-
-CONFUSION MATRIX
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-True Positives:  {self.true_positives}
-False Positives: {self.false_positives}
-True Negatives:  {self.true_negatives}
-False Negatives: {self.false_negatives}
-
-DETAILED METRICS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Precision: {precision:.2f}%
-Recall:    {recall:.2f}%
-F1-Score:  {f1:.2f}%
-                """
+                metrics_info = (
+                    "PERFORMANCE METRICS\n"
+                    "--------------------\n"
+                    f"Correct: {self.correct_predictions}\n"
+                    f"Incorrect: {self.total_predictions - self.correct_predictions}\n"
+                    f"Accuracy: {accuracy:.2f}%\n\n"
+                    "CONFUSION MATRIX\n"
+                    "--------------------\n"
+                    f"True Positives:  {self.true_positives}\n"
+                    f"False Positives: {self.false_positives}\n"
+                    f"True Negatives:  {self.true_negatives}\n"
+                    f"False Negatives: {self.false_negatives}\n\n"
+                    "DETAILED METRICS\n"
+                    "--------------------\n"
+                    f"Precision: {precision:.2f}%\n"
+                    f"Recall:    {recall:.2f}%\n"
+                    f"F1-Score:  {f1:.2f}%\n"
+                )
                 ax2.text(0.1, 0.5, metrics_info, fontsize=9, family='monospace',
                         verticalalignment='center')
                 
@@ -3557,7 +4223,7 @@ F1-Score:  {f1:.2f}%
                         actual = 'Real' if pred['actual'] == 1 else 'Fake'
                         predicted = 'Real' if pred['predicted'] == 1 else 'Fake'
                         confidence = f"{pred['confidence']:.2%}"
-                        result = '✓ Correct' if pred['correct'] else '✗ Wrong'
+                        result = 'Correct' if pred['correct'] else 'Wrong'
                         table_data.append([str(i), actual, predicted, confidence, result])
                     
                     # Create table
@@ -3574,7 +4240,7 @@ F1-Score:  {f1:.2f}%
                     
                     # Color code results
                     for i in range(1, len(table_data)):
-                        if '✓' in table_data[i][4]:
+                        if table_data[i][4] == 'Correct':
                             table[(i, 4)].set_facecolor('#d5f4e6')
                         else:
                             table[(i, 4)].set_facecolor('#fadbd8')
@@ -3584,6 +4250,86 @@ F1-Score:  {f1:.2f}%
                     
                     pdf.savefig(fig2)
                     plt.close(fig2)
+                
+                # Page 3: Detailed Classification Report
+                if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
+                    fig3 = plt.figure(figsize=(11, 8.5))
+                    fig3.suptitle('Detailed Classification Report', fontsize=16, weight='bold')
+                    ax = fig3.add_subplot(111)
+                    ax.axis('off')
+                    
+                    # Classification report text
+                    y_pos = 0.85
+                    fig3.text(0.5, y_pos, 'PER-CLASS METRICS', ha='center', fontsize=14, weight='bold')
+                    y_pos -= 0.05
+                    
+                    # Table header
+                    fig3.text(0.15, y_pos, 'Class', fontsize=12, weight='bold')
+                    fig3.text(0.35, y_pos, 'Precision', fontsize=12, weight='bold')
+                    fig3.text(0.5, y_pos, 'Recall', fontsize=12, weight='bold')
+                    fig3.text(0.65, y_pos, 'F1-Score', fontsize=12, weight='bold')
+                    fig3.text(0.8, y_pos, 'Support', fontsize=12, weight='bold')
+                    y_pos -= 0.03
+                    
+                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig3.transFigure, clip_on=False)
+                    y_pos -= 0.02
+                    
+                    # Class 0
+                    fig3.text(0.15, y_pos, 'Class 0 (Fake)', fontsize=11)
+                    fig3.text(0.35, y_pos, f"{self.classification_report['class_0']['precision']:.4f}", fontsize=11)
+                    fig3.text(0.5, y_pos, f"{self.classification_report['class_0']['recall']:.4f}", fontsize=11)
+                    fig3.text(0.65, y_pos, f"{self.classification_report['class_0']['f1-score']:.4f}", fontsize=11)
+                    fig3.text(0.8, y_pos, f"{int(self.classification_report['class_0']['support'])}", fontsize=11)
+                    y_pos -= 0.04
+                    
+                    # Class 1
+                    fig3.text(0.15, y_pos, 'Class 1 (Real)', fontsize=11)
+                    fig3.text(0.35, y_pos, f"{self.classification_report['class_1']['precision']:.4f}", fontsize=11)
+                    fig3.text(0.5, y_pos, f"{self.classification_report['class_1']['recall']:.4f}", fontsize=11)
+                    fig3.text(0.65, y_pos, f"{self.classification_report['class_1']['f1-score']:.4f}", fontsize=11)
+                    fig3.text(0.8, y_pos, f"{int(self.classification_report['class_1']['support'])}", fontsize=11)
+                    y_pos -= 0.02
+                    
+                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig3.transFigure, clip_on=False)
+                    y_pos -= 0.02
+                    
+                    # Accuracy
+                    fig3.text(0.15, y_pos, 'Accuracy', fontsize=11, weight='bold')
+                    fig3.text(0.65, y_pos, f"{self.classification_report['accuracy']:.4f}", fontsize=11, weight='bold')
+                    total_support = int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support'])
+                    fig3.text(0.8, y_pos, f"{total_support}", fontsize=11, weight='bold')
+                    y_pos -= 0.04
+                    
+                    # Macro Avg
+                    fig3.text(0.15, y_pos, 'Macro Avg', fontsize=11)
+                    fig3.text(0.35, y_pos, f"{self.classification_report['macro_avg']['precision']:.4f}", fontsize=11)
+                    fig3.text(0.5, y_pos, f"{self.classification_report['macro_avg']['recall']:.4f}", fontsize=11)
+                    fig3.text(0.65, y_pos, f"{self.classification_report['macro_avg']['f1-score']:.4f}", fontsize=11)
+                    fig3.text(0.8, y_pos, f"{total_support}", fontsize=11)
+                    y_pos -= 0.04
+                    
+                    # Weighted Avg
+                    fig3.text(0.15, y_pos, 'Weighted Avg', fontsize=11)
+                    fig3.text(0.35, y_pos, f"{self.classification_report['weighted_avg']['precision']:.4f}", fontsize=11)
+                    fig3.text(0.5, y_pos, f"{self.classification_report['weighted_avg']['recall']:.4f}", fontsize=11)
+                    fig3.text(0.65, y_pos, f"{self.classification_report['weighted_avg']['f1-score']:.4f}", fontsize=11)
+                    fig3.text(0.8, y_pos, f"{total_support}", fontsize=11)
+                    y_pos -= 0.08
+                    
+                    # Training metrics if available
+                    if self.training_start_time and self.training_duration > 0:
+                        fig3.text(0.5, y_pos, 'TRAINING PERFORMANCE', ha='center', fontsize=14, weight='bold')
+                        y_pos -= 0.05
+                        fig3.text(0.15, y_pos, f"Start Time: {self.training_start_time.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=11)
+                        y_pos -= 0.04
+                        fig3.text(0.15, y_pos, f"Duration: {self.training_duration:.2f} sec ({self.training_duration/60:.2f} min)", fontsize=11)
+                        y_pos -= 0.04
+                        fig3.text(0.15, y_pos, f"Peak Memory: {self.peak_memory_mb:.2f} MB", fontsize=11, weight='bold')
+                        y_pos -= 0.04
+                        fig3.text(0.15, y_pos, f"Avg Memory: {self.avg_memory_mb:.2f} MB", fontsize=11)
+                    
+                    pdf.savefig(fig3)
+                    plt.close(fig3)
             
             messagebox.showinfo("Export Successful", 
                               f"Report exported successfully to:\n{filename}")
@@ -3641,6 +4387,48 @@ F1-Score:  {f1:.2f}%
                 writer.writerow(['True Negatives (Fake → Fake)', self.true_negatives])
                 writer.writerow(['False Negatives (Real → Fake)', self.false_negatives])
                 writer.writerow([])
+                
+                # Detailed Classification Report
+                if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
+                    writer.writerow(['DETAILED CLASSIFICATION REPORT'])
+                    writer.writerow(['Class', 'Precision', 'Recall', 'F1-Score', 'Support'])
+                    writer.writerow(['Class 0 (Fake)', 
+                                   f"{self.classification_report['class_0']['precision']:.4f}",
+                                   f"{self.classification_report['class_0']['recall']:.4f}",
+                                   f"{self.classification_report['class_0']['f1-score']:.4f}",
+                                   int(self.classification_report['class_0']['support'])])
+                    writer.writerow(['Class 1 (Real)', 
+                                   f"{self.classification_report['class_1']['precision']:.4f}",
+                                   f"{self.classification_report['class_1']['recall']:.4f}",
+                                   f"{self.classification_report['class_1']['f1-score']:.4f}",
+                                   int(self.classification_report['class_1']['support'])])
+                    writer.writerow(['---', '---', '---', '---', '---'])
+                    writer.writerow(['Accuracy', '', '', 
+                                   f"{self.classification_report['accuracy']:.4f}",
+                                   int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support'])])
+                    writer.writerow(['Macro Avg', 
+                                   f"{self.classification_report['macro_avg']['precision']:.4f}",
+                                   f"{self.classification_report['macro_avg']['recall']:.4f}",
+                                   f"{self.classification_report['macro_avg']['f1-score']:.4f}",
+                                   int(self.classification_report['macro_avg']['support'])])
+                    writer.writerow(['Weighted Avg', 
+                                   f"{self.classification_report['weighted_avg']['precision']:.4f}",
+                                   f"{self.classification_report['weighted_avg']['recall']:.4f}",
+                                   f"{self.classification_report['weighted_avg']['f1-score']:.4f}",
+                                   int(self.classification_report['weighted_avg']['support'])])
+                    writer.writerow([])
+                
+                # Training Performance Metrics
+                if self.training_start_time and self.training_duration > 0:
+                    writer.writerow(['TRAINING PERFORMANCE'])
+                    writer.writerow(['Start Time', self.training_start_time.strftime('%Y-%m-%d %H:%M:%S')])
+                    if self.training_end_time:
+                        writer.writerow(['End Time', self.training_end_time.strftime('%Y-%m-%d %H:%M:%S')])
+                    writer.writerow(['Duration (seconds)', f"{self.training_duration:.2f}"])
+                    writer.writerow(['Duration (minutes)', f"{self.training_duration/60:.2f}"])
+                    writer.writerow(['Peak Memory (MB)', f"{self.peak_memory_mb:.2f}"])
+                    writer.writerow(['Average Memory (MB)', f"{self.avg_memory_mb:.2f}"])
+                    writer.writerow([])
                 
                 # Detailed Metrics
                 writer.writerow(['DETAILED METRICS'])

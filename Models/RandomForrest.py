@@ -182,21 +182,13 @@ class RandomForestFullFeatures():
         
         return type('History', (), {'history': history})()
     
-    def predict(self, X_test):
-        """Prediction method with full features and feature validation"""
+    def _prepare_features(self, X_test):
         if not self.is_fitted:
             raise ValueError("Model must be fitted before making predictions!")
-        
-        # If X_test is from a TensorFlow dataset, convert to numpy first
         if hasattr(X_test, 'numpy'):
-            # It's a TensorFlow tensor
             X_test = X_test.numpy()
-        
-        # If X_test is from a dataset batch, flatten it
         if len(X_test.shape) > 2:
             X_test = X_test.reshape(X_test.shape[0], -1)
-        
-        # CRITICAL: Validate feature count matches training data
         if X_test.shape[1] != self.n_features_in_:
             raise ValueError(
                 f"❌ FEATURE MISMATCH ERROR!\n"
@@ -212,14 +204,29 @@ class RandomForestFullFeatures():
                 f"   🔍 Prediction feature type: "
                 f"{'SPECTROGRAM' if X_test.shape[1] > 1000 else 'MFCC'}\n"
             )
-        
-        # Get prediction probabilities (no preprocessing needed!)
+        return X_test
+
+    def predict_proba(self, X_test):
+        """Return class probabilities after validating feature dimensions."""
+        X_test = self._prepare_features(X_test)
         pred_proba = self.model.predict_proba(X_test)
-        
+        if pred_proba.ndim == 1:
+            pred_proba = pred_proba.reshape(-1, 1)
         if pred_proba.shape[1] == 1:
-            return pred_proba.reshape(-1, 1)
-        else:
-            return pred_proba[:, 1].reshape(-1, 1)
+            real_col = pred_proba[:, 0]
+            fake_col = 1 - real_col
+            pred_proba = np.stack([fake_col, real_col], axis=1)
+        return pred_proba
+
+    def predict(self, X_test):
+        """Return class labels derived from probability estimates."""
+        pred_proba = self.predict_proba(X_test)
+        real_probs = pred_proba[:, 1]
+        return (real_probs >= 0.5).astype(int)
+
+    @property
+    def feature_importances_(self):
+        return getattr(self.model, 'feature_importances_', None)
     
     def summary(self):
         """Summary showing full features"""
