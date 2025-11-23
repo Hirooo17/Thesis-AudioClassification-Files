@@ -16,6 +16,7 @@ import psutil
 import csv
 from matplotlib.backends.backend_pdf import PdfPages
 import librosa
+import re
 
 class AdvancedSimulationAudioGUI:
     def __init__(self, root, loaded_models=None, loaded_datasets=None):
@@ -23,6 +24,14 @@ class AdvancedSimulationAudioGUI:
         self.root.title("🎵 Advanced Audio Classification - Live Prediction Feedback")
         self.root.geometry("1600x1000")  # Increased size
         self.root.configure(bg='#1a1a1a')  # Dark theme
+        self._running = True
+        self._prediction_thread = None
+        self._animation_job = None
+        self._sim_job = None
+        self._log_job = None
+        self._last_viz_update = 0.0
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._center_main_window()
         
         # Auto-load models and datasets if not provided
         if loaded_models is None:
@@ -45,6 +54,8 @@ class AdvancedSimulationAudioGUI:
         self.operation_progress = 0
         self.prediction_speed = tk.DoubleVar(value=1.0)
         self.auto_mode = tk.BooleanVar(value=False)
+        self.turbo_mode = tk.BooleanVar(value=False)
+        self.turbo_mode_enabled = False
         
         # Live prediction tracking
         self.correct_predictions = 0
@@ -107,6 +118,19 @@ class AdvancedSimulationAudioGUI:
         self.model_combo = None
         self.control_model_status = None
         self.export_model_btn = None
+        self.snr_tree = None
+        self.snr_empty_label = None
+        self.auto_training_queue = []
+        self.auto_training_active = False
+        self.auto_training_output_dir = None
+        self.auto_training_current = None
+        self.auto_training_status_label = None
+        self.auto_prediction_toggle = tk.BooleanVar(value=False)
+        self.auto_prediction_queue = []
+        self.auto_prediction_active = False
+        self.auto_prediction_output_dir = None
+        self.auto_prediction_status_label = None
+        self._current_prediction_auto_context = None
 
         # Check available models and datasets from notebook
         self.populate_dropdowns_from_data()
@@ -118,6 +142,48 @@ class AdvancedSimulationAudioGUI:
         self.update_logs()
         self.update_simulation_display()
         self.update_animations()
+
+    def _center_main_window(self):
+        """Center the main window on the active monitor."""
+        self.root.update_idletasks()
+        width = self.root.winfo_width() or 1600
+        height = self.root.winfo_height() or 1000
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        pos_x = max((screen_width - width) // 2, 0)
+        pos_y = max((screen_height - height) // 2, 0)
+        self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    def _enable_mousewheel(self, canvas):
+        """Attach smooth mouse wheel scrolling to a Tkinter canvas."""
+        canvas.configure(yscrollincrement=20)
+
+        def _on_mousewheel(event):
+            delta = 0
+            if event.delta:
+                delta = int(-event.delta / 120)
+            elif event.num == 4:
+                delta = -1
+            elif event.num == 5:
+                delta = 1
+            if delta:
+                canvas.yview_scroll(delta, "units")
+
+        canvas.bind("<Enter>", lambda _: canvas.focus_set())
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Shift-MouseWheel>", lambda e: canvas.xview_scroll(int(-e.delta / 120), "units"))
+        canvas.bind("<Button-4>", _on_mousewheel)
+        canvas.bind("<Button-5>", _on_mousewheel)
+
+    def _post_ui(self, func, *args, **kwargs):
+        """Safely queue UI work onto the Tk main loop."""
+        if not self._running:
+            return
+        if self.root and self.root.winfo_exists():
+            self.root.after(0, lambda: func(*args, **kwargs))
+
+    def _post_log(self, message, tag_type="info"):
+        self._post_ui(self.add_prediction_log, message, tag_type)
 
     def create_advanced_interface(self):
         """Create enhanced interface with dark theme and improved visuals"""
@@ -159,6 +225,7 @@ class AdvancedSimulationAudioGUI:
         
         canvas.create_window((0, 0), window=self.control_content, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
+        self._enable_mousewheel(canvas)
         
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -185,17 +252,15 @@ class AdvancedSimulationAudioGUI:
         
         pred_canvas.create_window((0, 0), window=self.pred_content, anchor="nw")
         pred_canvas.configure(yscrollcommand=pred_scrollbar.set)
-        
+        self._enable_mousewheel(pred_canvas)
+
         pred_canvas.pack(side="left", fill="both", expand=True)
         pred_scrollbar.pack(side="right", fill="y")
         
-        # Enable mouse wheel scrolling
-        def _on_pred_mousewheel(event):
-            pred_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        pred_canvas.bind_all("<MouseWheel>", _on_pred_mousewheel)
-        
         # Header with animated status
         self.create_animated_header(self.pred_content)
+
+        self.create_auto_prediction_controls(self.pred_content)
         
         # Live prediction display
         self.create_live_prediction_display(self.pred_content)
@@ -229,6 +294,39 @@ class AdvancedSimulationAudioGUI:
         self.live_counter = tk.Label(header_frame, text="🎯 Predictions: 0/0 | Accuracy: 0%", 
                                     font=('Arial', 14, 'bold'), fg='#ffaa00', bg='#0f3460')
         self.live_counter.pack()
+
+    def create_auto_prediction_controls(self, parent):
+        """Create toggle + status display for automated SNR prediction runs."""
+        auto_frame = tk.LabelFrame(parent, text="🤖 Auto SNR Prediction", font=('Arial', 14, 'bold'),
+                                   bg='#1a1a1a', fg='white', padx=20, pady=15)
+        auto_frame.pack(fill='x', padx=10, pady=(0, 10))
+
+        description = ("Automatically run live predictions across every available SNR dataset. "
+                       "Select the starting dataset in the Control Center and enable the toggle "
+                       "to queue the remaining SNR levels in ascending order.")
+        tk.Label(auto_frame, text=description, font=('Arial', 11), wraplength=900,
+                 justify='left', bg='#1a1a1a', fg='#ecf0f1').pack(anchor='w')
+
+        controls_row = tk.Frame(auto_frame, bg='#1a1a1a')
+        controls_row.pack(fill='x', pady=8)
+
+        tk.Checkbutton(controls_row,
+                       text="Enable Auto SNR Prediction",
+                       variable=self.auto_prediction_toggle,
+                       font=('Arial', 12, 'bold'),
+                       bg='#1a1a1a', fg='#00d4ff',
+                       selectcolor='#0f3460',
+                       activebackground='#1a1a1a',
+                       activeforeground='#00d4ff').pack(side='left')
+
+        status_container = tk.Frame(auto_frame, bg='#1a1a1a')
+        status_container.pack(fill='x')
+        tk.Label(status_container, text="Status:", font=('Arial', 11, 'bold'),
+                 bg='#1a1a1a', fg='#95a5a6').pack(side='left')
+        self.auto_prediction_status_label = tk.Label(status_container, text="Idle",
+                                                     font=('Arial', 11),
+                                                     bg='#1a1a1a', fg='#95a5a6')
+        self.auto_prediction_status_label.pack(side='left', padx=5)
         
     def create_live_prediction_display(self, parent):
         """Create live prediction display with visual feedback"""
@@ -649,17 +747,49 @@ class AdvancedSimulationAudioGUI:
                             font=('Arial', 9), bg='#34495e', fg='#95a5a6', 
                             justify='left')
         size_note.pack(anchor='w', pady=2)
+
+        turbo_frame = tk.Frame(settings_frame, bg='#34495e')
+        turbo_frame.pack(fill='x', pady=(10, 0))
+        tk.Checkbutton(
+            turbo_frame,
+            text="⚡ Enable Turbo Mode (skip most UI updates)",
+            variable=self.turbo_mode,
+            font=('Arial', 12, 'bold'),
+            bg='#34495e',
+            fg='white',
+            selectcolor='#2c3e50',
+            activebackground='#34495e',
+            activeforeground='white'
+        ).pack(anchor='w')
         
-    def start_live_prediction(self):
+    def start_live_prediction(self, auto_context=None):
         """Start enhanced live prediction with feedback"""
         if self.is_processing:
             return
+
+        if auto_context is None and self.auto_prediction_toggle.get():
+            if self.auto_prediction_active:
+                messagebox.showinfo("Auto Prediction", "Automatic prediction run already in progress.")
+            else:
+                self._init_auto_prediction_run()
+            return
+        
+        if self.auto_prediction_active and auto_context is None:
+            messagebox.showwarning("Auto Prediction", "Wait for the auto SNR cycle to finish before starting a manual session.")
+            return
+        
+        if auto_context is None:
+            self._current_prediction_auto_context = None
+        else:
+            self._current_prediction_auto_context = auto_context
             
         self.is_processing = True
         self.correct_predictions = 0
         self.total_predictions = 0
         self.recent_predictions = []
         self.prediction_history = []
+        self.current_snr_level = None
+        self.turbo_mode_enabled = bool(self.turbo_mode.get())
         
         # Reset confusion matrix
         self.true_positives = 0
@@ -671,18 +801,25 @@ class AdvancedSimulationAudioGUI:
         self.predict_btn.config(state='disabled', bg='#95a5a6')
         
         # Clear feed
-        self.prediction_feed.delete(1.0, tk.END)
+        if auto_context is None:
+            self.prediction_feed.delete(1.0, tk.END)
+        else:
+            self.add_prediction_log("\n" + "=" * 60, "info")
+            self.add_prediction_log(f"🤖 Auto Prediction Run: {auto_context.get('display', auto_context.get('dataset_key', 'Unknown'))}", "info")
         self.add_prediction_log("🚀 Starting Live Prediction Session...", "info")
         self.add_prediction_log("📊 Loading samples and generating predictions...", "info")
+        if self.turbo_mode_enabled:
+            self.add_prediction_log("⚡ Turbo mode enabled: UI updates will be throttled for maximum speed.", "warning")
         
         # Start prediction thread
-        threading.Thread(target=self._live_prediction_thread, daemon=True).start()
+        self._prediction_thread = threading.Thread(target=self._live_prediction_thread, daemon=True)
+        self._prediction_thread.start()
         
     def _live_prediction_thread(self):
         """Enhanced live prediction thread with detailed feedback using real datasets"""
         try:
             total_samples = int(self.sample_size.get())
-            self.add_prediction_log(f"🎯 Processing {total_samples} samples...", "info")
+            self._post_log(f"🎯 Processing {total_samples} samples...", "info")
             
             # Get selected dataset
             selected_key = self.selected_dataset.get()
@@ -702,6 +839,19 @@ class AdvancedSimulationAudioGUI:
                 
             dataset_name = parts[0]
             split_type = parts[1]  # 'train', 'val', or 'test'
+
+            snr_label, snr_value = self._infer_snr_level_from_name(dataset_name)
+            if snr_label is not None:
+                self.current_snr_level = {
+                    'label': snr_label,
+                    'value': snr_value,
+                    'dataset': dataset_name,
+                    'model': self.selected_model.get()
+                }
+                self.root.after(0, lambda label=snr_label: self.add_prediction_log(
+                    f"📉 SNR context detected: {label}", "info"))
+            else:
+                self.current_snr_level = None
             
             # Get the actual dataset
             if dataset_name not in self.datasets:
@@ -787,15 +937,26 @@ class AdvancedSimulationAudioGUI:
                           self.add_prediction_log(f"✅ Loaded {sl} samples from {dn} ({st})", "correct"))
             self.root.after(0, lambda: self.add_prediction_log(f"🚀 Starting prediction...", "info"))
             
+            turbo_mode = getattr(self, 'turbo_mode_enabled', False)
+            turbo_interval = 1
+            sample_count_total = len(samples_x)
+            if turbo_mode and sample_count_total > 0:
+                turbo_interval = max(1, sample_count_total // 40)
+
             # Process each sample
-            for sample_num in range(len(samples_x)):
+            for sample_num in range(sample_count_total):
                 if not self.is_processing:
                     break
+                should_update_ui = (not turbo_mode or
+                                    sample_num == 0 or
+                                    sample_num % turbo_interval == 0 or
+                                    sample_num == sample_count_total - 1)
                     
                 # Update current sample display with dataset info
                 dataset_display = f"{dataset_name} ({split_type})"
-                self.root.after(0, lambda s=sample_num+1, t=len(samples_x), d=dataset_display: 
-                               self.update_current_sample(s, t, d))
+                if should_update_ui:
+                    self.root.after(0, lambda s=sample_num+1, t=sample_count_total, d=dataset_display: 
+                                   self.update_current_sample(s, t, d))
                 
                 # Get actual sample and label
                 sample_x = samples_x[sample_num]
@@ -872,7 +1033,8 @@ class AdvancedSimulationAudioGUI:
                     'confidence': confidence,
                     'correct': is_correct,
                     'timestamp': datetime.now(),
-                    'dataset': dataset_display
+                    'dataset': dataset_display,
+                    'snr_label': self.current_snr_level['label'] if self.current_snr_level else None
                 }
                 
                 self.prediction_history.append(prediction_data)
@@ -883,19 +1045,20 @@ class AdvancedSimulationAudioGUI:
                     self.recent_predictions.pop(0)
                 
                 # Update displays
-                self.root.after(0, lambda pd=prediction_data, sn=sample_num+1, ts=len(samples_x): 
-                               self.update_prediction_displays(pd, sn, ts))
-                
-                # Add detailed log entry
-                self.root.after(0, lambda pd=prediction_data: self.log_prediction_result(pd))
+                if should_update_ui:
+                    self.root.after(0, lambda pd=prediction_data, sn=sample_num+1, ts=sample_count_total: 
+                                   self.update_prediction_displays(pd, sn, ts))
+                    self.root.after(0, lambda pd=prediction_data: self.log_prediction_result(pd))
                 
                 # Update progress
                 progress = ((sample_num + 1) / len(samples_x)) * 100
                 self.operation_progress = progress
-                self.root.after(0, lambda p=progress: self.update_progress_displays(p))
+                if should_update_ui:
+                    self.root.after(0, lambda p=progress: self.update_progress_displays(p))
                 
                 # Simulate processing time with speed control
-                time.sleep(0.5 / self.prediction_speed.get())
+                if not turbo_mode:
+                    time.sleep(0.5 / max(0.1, self.prediction_speed.get()))
                 
             # Generate detailed classification report
             if len(self.prediction_history) > 0:
@@ -949,6 +1112,10 @@ class AdvancedSimulationAudioGUI:
             error_msg = f"❌ Error: {e}\n{traceback.format_exc()}"
             self.root.after(0, lambda: self.add_prediction_log(error_msg, "incorrect"))
             self.is_processing = False
+            if self._current_prediction_auto_context:
+                self.root.after(0, lambda msg=str(e): self._handle_auto_prediction_failure(msg))
+        finally:
+            self._prediction_thread = None
             
     def update_current_sample(self, sample_num, total_samples, dataset_info=None):
         """Update current sample display with detailed information"""
@@ -1119,12 +1286,14 @@ class AdvancedSimulationAudioGUI:
         self.is_processing = False
         self.main_status.config(text="🏁 PREDICTION SESSION COMPLETE", fg='#00ff88')
         self.predict_btn.config(state='normal', bg='#00d4ff')
+        auto_context = self._current_prediction_auto_context
         
         # Calculate final statistics
         total = self.total_predictions
         correct = self.correct_predictions
         incorrect = total - correct
-        accuracy = (correct / total * 100) if total > 0 else 0
+        accuracy_fraction = (correct / total) if total > 0 else 0
+        accuracy = accuracy_fraction * 100
         
         # Add comprehensive summary to log
         self.add_prediction_log("=" * 60, "info")
@@ -1134,6 +1303,8 @@ class AdvancedSimulationAudioGUI:
         self.add_prediction_log(f"✅ Correct Predictions: {correct}", "correct")
         self.add_prediction_log(f"❌ Incorrect Predictions: {incorrect}", "incorrect")
         self.add_prediction_log(f"🎯 Final Accuracy: {accuracy:.2f}%", "info")
+
+        self._record_snr_performance(self.correct_predictions, self.total_predictions)
         
         # Confusion Matrix Display
         self.add_prediction_log("", "info")
@@ -1191,8 +1362,15 @@ class AdvancedSimulationAudioGUI:
         # Update results tab
         self.update_results_tab()
         
-        # Show summary popup
-        self.show_session_summary()
+        # Auto prediction exports / summary handling
+        if auto_context and self.auto_prediction_active:
+            ctx = auto_context
+            self._current_prediction_auto_context = None
+            self.root.after(0, lambda context=ctx: self._handle_auto_prediction_success(context))
+        else:
+            self._current_prediction_auto_context = None
+            # Show summary popup only for manual runs
+            self.show_session_summary()
         
     def show_session_summary(self):
         """Show detailed session summary popup"""
@@ -1242,6 +1420,8 @@ Final Accuracy: {accuracy:.2f}%
         self.main_status.config(text="🔴 SIMULATION STOPPED", fg='#ff4757')
         self.predict_btn.config(state='normal', bg='#00d4ff')
         self.add_prediction_log("🛑 Prediction session stopped by user", "warning")
+        if self.auto_prediction_active:
+            self._finish_auto_prediction_session("Auto predictions stopped")
         
     def reset_simulation(self):
         """Reset simulation state"""
@@ -1293,6 +1473,144 @@ Final Accuracy: {accuracy:.2f}%
         self.prediction_feed.delete(1.0, tk.END)
         self.add_prediction_log("🔄 System Reset Complete", "info")
         self.add_prediction_log("📊 Ready for new prediction session!", "info")
+
+        if self.auto_prediction_active:
+            self._finish_auto_prediction_session("Auto predictions reset")
+
+    def _build_snr_prediction_queue(self):
+        """Build ordered list of SNR datasets based on the current selection."""
+        entries = []
+        if not self.datasets:
+            return entries
+
+        selected_key = self.selected_dataset.get()
+        selected_base = None
+        selected_split = 'test'
+        selected_value = None
+
+        if selected_key and selected_key != 'none':
+            parts = selected_key.rsplit('_', 1)
+            if len(parts) == 2:
+                selected_base, selected_split = parts[0], parts[1]
+        if selected_split not in ('train', 'val', 'test'):
+            selected_split = 'test'
+
+        if selected_base:
+            _, selected_value = self._infer_snr_level_from_name(selected_base)
+            if selected_value is None:
+                selected_value = self._extract_snr_numeric(selected_base)
+
+        for base_name, split_dict in self.datasets.items():
+            if selected_split not in split_dict or split_dict[selected_split] is None:
+                continue
+            if not base_name.lower().startswith('snr'):
+                continue
+            label, snr_value = self._infer_snr_level_from_name(base_name)
+            if snr_value is None:
+                snr_value = self._extract_snr_numeric(base_name)
+            if snr_value is None:
+                continue
+            entries.append({
+                'base': base_name,
+                'snr_value': snr_value,
+                'dataset_key': f"{base_name}_{selected_split}",
+                'display': f"SNR {snr_value} dB" if label else base_name,
+                'split': selected_split
+            })
+
+        entries.sort(key=lambda item: item['snr_value'])
+
+        if selected_value is not None:
+            entries = [entry for entry in entries if entry['snr_value'] >= selected_value]
+
+        return entries
+
+    def _init_auto_prediction_run(self):
+        queue = self._build_snr_prediction_queue()
+        if not queue:
+            messagebox.showwarning("Auto Prediction", "No matching SNR datasets found for automatic prediction.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.join("auto_prediction_reports", f"session_{timestamp}")
+        os.makedirs(base_dir, exist_ok=True)
+
+        self.auto_prediction_queue = queue
+        self.auto_prediction_output_dir = base_dir
+        self.auto_prediction_active = True
+        if self.auto_prediction_status_label:
+            self.auto_prediction_status_label.config(text=f"Queued {len(queue)} dataset(s)")
+
+        self.add_prediction_log("🤖 Auto SNR Prediction session initialized", "info")
+        for entry in queue:
+            self.add_prediction_log(f"   • {entry['display']} ({entry['dataset_key']})", "info")
+
+        self._start_next_auto_prediction()
+
+    def _start_next_auto_prediction(self):
+        if not self.auto_prediction_active:
+            return
+
+        if not self.auto_prediction_queue:
+            self._finish_auto_prediction_session("Auto prediction complete")
+            return
+
+        if self.is_processing:
+            return  # wait for current session to finish
+
+        next_entry = self.auto_prediction_queue.pop(0)
+        dataset_key = next_entry['dataset_key']
+        if dataset_key not in self.available_datasets:
+            self.add_prediction_log(f"⚠️ Skipping {dataset_key} - not in dropdown list", "warning")
+            self.root.after(0, self._start_next_auto_prediction)
+            return
+
+        self.selected_dataset.set(dataset_key)
+        self._current_prediction_auto_context = next_entry
+        if self.auto_prediction_status_label:
+            self.auto_prediction_status_label.config(text=f"Running {next_entry['display']}")
+
+        self.start_live_prediction(auto_context=next_entry)
+
+    def _handle_auto_prediction_success(self, context):
+        dataset_name = context.get('dataset_key', 'dataset')
+        display = context.get('display', dataset_name)
+        output_dir = self.auto_prediction_output_dir or context.get('output_dir')
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            safe_name = dataset_name.replace('/', '_')
+            pdf_name = os.path.join(output_dir, f"{safe_name}_analysis.pdf")
+            csv_name = os.path.join(output_dir, f"{safe_name}_results.csv")
+            self.export_to_pdf(pdf_name, silent=True)
+            self.export_to_csv(csv_name, silent=True)
+            self.add_prediction_log(f"📁 Auto export complete for {display} → {output_dir}", "correct")
+        else:
+            self.add_prediction_log(f"⚠️ Output directory missing for {display}", "warning")
+
+        if self.auto_prediction_queue:
+            if self.auto_prediction_status_label:
+                self.auto_prediction_status_label.config(text="Advancing to next SNR...")
+            self.root.after(800, self._start_next_auto_prediction)
+        else:
+            self._finish_auto_prediction_session("Auto prediction complete")
+
+    def _handle_auto_prediction_failure(self, message):
+        self.add_prediction_log(f"❌ Auto prediction session stopped: {message}", "error")
+        self._finish_auto_prediction_session("Auto predictions halted")
+
+    def _finish_auto_prediction_session(self, status_text):
+        output_dir = self.auto_prediction_output_dir
+        self.auto_prediction_active = False
+        self.auto_prediction_queue = []
+        self.auto_prediction_output_dir = None
+        self._current_prediction_auto_context = None
+        if self.auto_prediction_status_label:
+            self.auto_prediction_status_label.config(text=status_text)
+        self.auto_prediction_toggle.set(False)
+        if status_text.lower().startswith("auto prediction complete") and output_dir:
+            messagebox.showinfo("Auto Prediction", 
+                                f"Auto SNR prediction finished!\nReports saved in:\n{output_dir}")
     
     def create_training_tab(self):
         """Create training tab for model training with SCROLLABLE area"""
@@ -1325,14 +1643,10 @@ Final Accuracy: {accuracy:.2f}%
         
         train_canvas.create_window((0, 0), window=self.training_content, anchor="nw")
         train_canvas.configure(yscrollcommand=train_scrollbar.set)
-        
+        self._enable_mousewheel(train_canvas)
+
         train_canvas.pack(side="left", fill="both", expand=True)
         train_scrollbar.pack(side="right", fill="y")
-        
-        # Enable mouse wheel scrolling
-        def _on_mousewheel(event):
-            train_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        train_canvas.bind_all("<MouseWheel>", _on_mousewheel)
         
         # Training configuration (now inside scrollable area)
         config_frame = tk.LabelFrame(self.training_content, text="⚙️ Training Configuration", 
@@ -1571,6 +1885,34 @@ Final Accuracy: {accuracy:.2f}%
                           height=2, width=25, relief='raised', bd=5,
                           state='disabled')
         self.export_model_btn.pack(side='left', padx=10)
+
+        # Auto SNR training controls
+        auto_frame = tk.LabelFrame(self.training_content, text="🤖 Auto SNR Training Suite", 
+                       font=('Arial', 16, 'bold'), bg='#34495e', fg='white',
+                       padx=20, pady=20)
+        auto_frame.pack(fill='x', padx=10, pady=10)
+
+        tk.Label(auto_frame,
+             text=("Run every available SNR dataset back-to-back. "
+                   "Uses the currently selected SNR level as the starting point "
+                   "and auto-exports each training report."),
+             font=('Arial', 12), bg='#34495e', fg='#ecf0f1', justify='left',
+             wraplength=900).pack(anchor='w', pady=(0, 10))
+
+        status_row = tk.Frame(auto_frame, bg='#34495e')
+        status_row.pack(fill='x')
+        tk.Label(status_row, text="Status:", font=('Arial', 12, 'bold'),
+            bg='#34495e', fg='#ecf0f1').pack(side='left')
+        self.auto_training_status_label = tk.Label(status_row,
+                               text="Idle",
+                               font=('Arial', 12),
+                               bg='#34495e', fg='#95a5a6')
+        self.auto_training_status_label.pack(side='left', padx=5)
+
+        tk.Button(auto_frame, text="⚡ START AUTO SNR TRAINING", 
+              command=self.start_auto_snr_training,
+              bg='#e67e22', fg='white', font=('Arial', 14, 'bold'),
+              height=2, width=35, relief='raised', bd=4).pack(pady=10)
         
         # Training progress (now in scrollable area)
         progress_frame = tk.LabelFrame(self.training_content, text="📊 Training Progress", 
@@ -1619,11 +1961,162 @@ Final Accuracy: {accuracy:.2f}%
         self.training_log.insert(tk.END, full_message, tag_type)
         self.training_log.see(tk.END)
         self.training_log.update_idletasks()
+
+    def start_auto_snr_training(self):
+        """Run sequential trainings across SNR datasets starting from the selected level."""
+        if self.is_processing:
+            messagebox.showwarning("Training In Progress", "Finish the current training before starting auto mode.")
+            return
+
+        if self.auto_training_active:
+            messagebox.showinfo("Auto Training", "An auto SNR training session is already running.")
+            return
+
+        queue = self._build_snr_training_queue()
+        if not queue:
+            messagebox.showwarning("No SNR Datasets", "Could not locate matching SNR train/val datasets.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.join("auto_training_reports", f"session_{timestamp}")
+        os.makedirs(base_dir, exist_ok=True)
+
+        self.auto_training_queue = queue
+        self.auto_training_output_dir = base_dir
+        self.auto_training_active = True
+        if self.auto_training_status_label is not None:
+            self.auto_training_status_label.config(text=f"Queued {len(queue)} dataset(s)")
+
+        self.add_training_log("🤖 Auto SNR Training Session initialized", "info")
+        for entry in queue:
+            self.add_training_log(f"   • {entry['display']} (train={entry['train_key']}, val={entry['val_key']})", "info")
+
+        self._run_next_auto_training()
+
+    def _build_snr_training_queue(self):
+        entries = []
+        if not self.datasets:
+            return entries
+
+        for base_name, split_data in self.datasets.items():
+            if not base_name.lower().startswith('snr'):
+                continue
+            if split_data.get('train') is None or split_data.get('val') is None:
+                continue
+            label, snr_value = self._infer_snr_level_from_name(base_name)
+            if snr_value is None:
+                snr_value = self._extract_snr_numeric(base_name)
+            if snr_value is None:
+                continue
+            entries.append({
+                'base': base_name,
+                'snr_value': snr_value,
+                'train_key': f"{base_name}_train",
+                'val_key': f"{base_name}_val",
+                'display': f"SNR {snr_value} dB" if label else base_name
+            })
+
+        entries.sort(key=lambda item: item['snr_value'])
+
+        current_base = None
+        current_value = None
+        selected_train = self.train_dataset_var.get()
+        if selected_train:
+            parts = selected_train.rsplit('_', 1)
+            if len(parts) == 2:
+                current_base = parts[0]
+        if current_base:
+            _, current_value = self._infer_snr_level_from_name(current_base)
+            if current_value is None:
+                current_value = self._extract_snr_numeric(current_base)
+
+        if current_value is not None:
+            entries = [entry for entry in entries if entry['snr_value'] >= current_value]
+
+        return entries
+
+    def _extract_snr_numeric(self, name):
+        match = re.search(r'snr[_-]?(\d+)', name.lower())
+        return int(match.group(1)) if match else None
+
+    def _run_next_auto_training(self):
+        if not self.auto_training_active:
+            return
+
+        if not self.auto_training_queue:
+            self._finish_auto_training_session("✅ Auto session complete")
+            return
+
+        next_entry = self.auto_training_queue.pop(0)
+        self.auto_training_current = next_entry
+
+        if next_entry['train_key'] not in self.available_datasets or next_entry['val_key'] not in self.available_datasets:
+            self.add_training_log(f"⚠️ Skipping {next_entry['base']} - dataset not in dropdowns", "warning")
+            self.root.after(0, self._run_next_auto_training)
+            return
+
+        self.train_dataset_var.set(next_entry['train_key'])
+        self.val_dataset_var.set(next_entry['val_key'])
+
+        if self.auto_training_status_label is not None:
+            self.auto_training_status_label.config(text=f"Training {next_entry['display']}")
+
+        self.add_training_log(f"🚀 Auto session: Training {next_entry['display']}", "info")
+
+        context = {
+            'mode': 'auto_snr',
+            'base': next_entry['base'],
+            'display': next_entry['display'],
+            'output_dir': self.auto_training_output_dir
+        }
+        self.start_training(auto_context=context)
+
+    def _handle_auto_training_success(self, context):
+        display = context.get('display', context.get('base', 'Unknown SNR'))
+        output_dir = context.get('output_dir') or self.auto_training_output_dir
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            pdf_path = os.path.join(output_dir, f"{context['base']}_training_report.pdf")
+            csv_path = os.path.join(output_dir, f"{context['base']}_training_summary.csv")
+            self.export_training_to_pdf(pdf_path, silent=True)
+            self.export_training_to_csv(csv_path, silent=True)
+            self.add_training_log(f"📁 Saved analysis for {display} → {output_dir}", "success")
+        else:
+            self.add_training_log(f"⚠️ No output directory configured for {display}", "warning")
+
+        if self.auto_training_queue:
+            if self.auto_training_status_label is not None:
+                self.auto_training_status_label.config(text="Advancing to next SNR...")
+            self.root.after(750, self._run_next_auto_training)
+        else:
+            self._finish_auto_training_session("🎉 Auto session complete")
+
+    def _handle_auto_training_failure(self, context, error_message):
+        display = context.get('display', context.get('base', 'Unknown SNR'))
+        self.add_training_log(f"❌ Auto session stopped while training {display}: {error_message}", "error")
+        self._finish_auto_training_session("⚠️ Auto session halted")
+
+    def _finish_auto_training_session(self, message):
+        self.auto_training_active = False
+        self.auto_training_queue = []
+        self.auto_training_output_dir = None
+        self.auto_training_current = None
+        if self.auto_training_status_label is not None:
+            self.auto_training_status_label.config(text=message)
+        messagebox.showinfo("Auto Training", message)
     
-    def start_training(self):
+    def start_training(self, auto_context=None):
         """Start model training in a separate thread"""
         if self.is_processing:
-            messagebox.showwarning("Training In Progress", "A training session is already running!")
+            if auto_context:
+                self.add_training_log("⚠️ Training already running - auto session waiting", "warning")
+                self.root.after(1000, lambda ctx=auto_context: self.start_training(auto_context=ctx))
+            else:
+                messagebox.showwarning("Training In Progress", "A training session is already running!")
+            return
+
+        if self.auto_training_active and auto_context is None:
+            messagebox.showwarning("Auto Session Active", "Wait for the auto SNR training to finish before starting a manual run.")
             return
         
         self.is_processing = True
@@ -1634,14 +2127,20 @@ Final Accuracy: {accuracy:.2f}%
         if self.export_model_btn is not None:
             self.export_model_btn.config(state='disabled')
         
-        self.training_log.delete(1.0, tk.END)
-        self.add_training_log("🚀 Starting Training Session...", "info")
+        if auto_context is None:
+            self.training_log.delete(1.0, tk.END)
+            self.add_training_log("🚀 Starting Training Session...", "info")
+        else:
+            self.add_training_log("\n" + "=" * 60, "info")
+            self.add_training_log(f"🤖 Auto SNR Training → {auto_context.get('display', auto_context.get('base', 'Unknown'))}", "info")
         
         # Start training thread
-        threading.Thread(target=self._training_thread, daemon=True).start()
+        threading.Thread(target=self._training_thread, args=(auto_context,), daemon=True).start()
     
-    def _training_thread(self):
+    def _training_thread(self, auto_context=None):
         """Training thread"""
+        training_success = False
+        error_message = ""
         try:
             # Get selected datasets
             train_key = self.train_dataset_var.get()
@@ -1950,16 +2449,23 @@ Final Accuracy: {accuracy:.2f}%
             
             # Update the main model reference
             self.model = model
+            training_success = True
             
         except Exception as e:
             import traceback
             error_msg = f"❌ Training Error: {e}\n{traceback.format_exc()}"
             self.root.after(0, lambda: self.add_training_log(error_msg, "error"))
             self.root.after(0, lambda: self.training_progress_bar.stop())
+            error_message = str(e)
         
         finally:
             self.is_processing = False
             self.root.after(0, lambda: self.train_btn.config(state='normal', bg='#27ae60'))
+            if auto_context:
+                if training_success:
+                    self.root.after(0, lambda ctx=auto_context: self._handle_auto_training_success(ctx))
+                else:
+                    self.root.after(0, lambda ctx=auto_context, err=error_message: self._handle_auto_training_failure(ctx, err or 'Unknown error'))
     
     def save_trained_model(self):
         """Save the trained model"""
@@ -2049,14 +2555,10 @@ Final Accuracy: {accuracy:.2f}%
         
         monitor_canvas.create_window((0, 0), window=self.monitor_content, anchor="nw")
         monitor_canvas.configure(yscrollcommand=monitor_scrollbar.set)
-        
+        self._enable_mousewheel(monitor_canvas)
+
         monitor_canvas.pack(side="left", fill="both", expand=True)
         monitor_scrollbar.pack(side="right", fill="y")
-        
-        # Enable mouse wheel scrolling
-        def _on_monitor_mousewheel(event):
-            monitor_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        monitor_canvas.bind_all("<MouseWheel>", _on_monitor_mousewheel)
         
         # Add enhanced monitoring features (simplified for space)
         self.create_system_resources_monitor(self.monitor_content)
@@ -2107,19 +2609,22 @@ Final Accuracy: {accuracy:.2f}%
         export_frame.pack(fill='x', padx=10, pady=5)
         
         tk.Button(export_frame, text="📄 Export to PDF", 
-                 command=self.export_to_pdf,
-                 bg='#e74c3c', fg='white', font=('Arial', 12, 'bold'),
-                 height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
+             command=self.export_to_pdf,
+             bg='#e74c3c', fg='#0b0b0b', font=('Arial', 12, 'bold'),
+             activebackground='#ff6b6b', activeforeground='#0b0b0b',
+             height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
         
         tk.Button(export_frame, text="📊 Export to CSV", 
-                 command=self.export_to_csv,
-                 bg='#27ae60', fg='white', font=('Arial', 12, 'bold'),
-                 height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
+             command=self.export_to_csv,
+             bg='#27ae60', fg='#0b0b0b', font=('Arial', 12, 'bold'),
+             activebackground='#2ecc71', activeforeground='#0b0b0b',
+             height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
         
         tk.Button(export_frame, text="📋 Export Summary", 
-                 command=self.export_summary_txt,
-                 bg='#3498db', fg='white', font=('Arial', 12, 'bold'),
-                 height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
+             command=self.export_summary_txt,
+             bg='#3498db', fg='#0b0b0b', font=('Arial', 12, 'bold'),
+             activebackground='#5dade2', activeforeground='#0b0b0b',
+             height=1, width=20, relief='raised', bd=3).pack(side='left', padx=5)
         
         # Create SCROLLABLE container
         results_canvas = tk.Canvas(results_frame, bg='#2c3e50', highlightthickness=0)
@@ -2133,14 +2638,10 @@ Final Accuracy: {accuracy:.2f}%
         
         results_canvas.create_window((0, 0), window=self.results_content, anchor="nw")
         results_canvas.configure(yscrollcommand=results_scrollbar.set)
-        
+        self._enable_mousewheel(results_canvas)
+
         results_canvas.pack(side="left", fill="both", expand=True)
         results_scrollbar.pack(side="right", fill="y")
-        
-        # Enable mouse wheel scrolling
-        def _on_results_mousewheel(event):
-            results_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        results_canvas.bind_all("<MouseWheel>", _on_results_mousewheel)
         
         # Metrics summary
         metrics_frame = tk.LabelFrame(self.results_content, text="📈 Session Metrics", 
@@ -2194,6 +2695,40 @@ Final Accuracy: {accuracy:.2f}%
         metrics_grid.columnconfigure(3, weight=1)
         
         # Confusion Matrix visualization
+        snr_frame = tk.LabelFrame(self.results_content, text="📉 SNR Degradation Analysis", 
+                                  font=('Arial', 16, 'bold'), bg='#34495e', fg='white',
+                                  padx=20, pady=15)
+        snr_frame.pack(fill='x', padx=10, pady=10)
+
+        snr_columns = ("model", "loss", "range", "rate", "classification")
+        tree_container = tk.Frame(snr_frame, bg='#34495e')
+        tree_container.pack(fill='both', expand=True)
+
+        self.snr_tree = ttk.Treeview(tree_container, columns=snr_columns, show='headings', height=6)
+        headings = {
+            "model": "Model",
+            "loss": "Total Accuracy Loss",
+            "range": "SNR Range",
+            "rate": "Degradation Rate (%/dB)",
+            "classification": "Classification"
+        }
+        for key in snr_columns:
+            self.snr_tree.heading(key, text=headings[key])
+            anchor = 'center' if key != 'range' else 'w'
+            width = 180 if key in ('range', 'classification') else 150
+            self.snr_tree.column(key, anchor=anchor, stretch=True, width=width)
+
+        snr_scroll = ttk.Scrollbar(tree_container, orient='vertical', command=self.snr_tree.yview)
+        self.snr_tree.configure(yscrollcommand=snr_scroll.set)
+        self.snr_tree.pack(side='left', fill='both', expand=True)
+        snr_scroll.pack(side='right', fill='y')
+
+        self.snr_empty_label = tk.Label(snr_frame,
+                                       text="Run predictions using SNR-specific datasets to generate degradation analysis.",
+                                       font=('Arial', 12, 'italic'), bg='#34495e', fg="#625858")
+        self.snr_empty_label.pack(fill='x', pady=(10, 0))
+
+        # Confusion Matrix visualization
         confusion_frame = tk.LabelFrame(results_frame, text="🔢 Confusion Matrix", 
                                        font=('Arial', 16, 'bold'), bg='#34495e', fg='white',
                                        padx=20, pady=20)
@@ -2217,6 +2752,9 @@ Final Accuracy: {accuracy:.2f}%
         self.results_canvas = FigureCanvasTkAgg(self.results_fig, confusion_frame)
         self.results_canvas.draw()
         self.results_canvas.get_tk_widget().pack(fill='both', expand=True)
+
+        # Initialize SNR analysis view state
+        self._update_snr_analysis_display()
     
     def update_results_tab(self):
         """Update results tab with session data"""
@@ -2272,6 +2810,160 @@ Final Accuracy: {accuracy:.2f}%
         
         plt.tight_layout()
         self.results_canvas.draw()
+        self._update_snr_analysis_display()
+
+    def _infer_snr_level_from_name(self, dataset_name):
+        """Infer SNR label/value based on dataset name patterns."""
+        if not dataset_name:
+            return (None, None)
+        lower = dataset_name.lower()
+        word_map = {
+            'zero': 0,
+            'five': 5,
+            'ten': 10,
+            'fifteen': 15,
+            'twenty': 20,
+            'twentyfive': 25,
+            'twenty_five': 25,
+            'thirty': 30,
+            'thirtyfive': 35,
+            'clean': 30
+        }
+        match = re.search(r'snr[\-_\s]?(\d+)', lower)
+        if match:
+            value = float(match.group(1))
+            return (f"{int(value)} dB", value)
+        for key, value in word_map.items():
+            token = f"snr_{key}"
+            if token in lower or (key == 'clean' and 'clean' in lower):
+                label = 'Clean' if key == 'clean' else f"{int(value)} dB"
+                return (label, float(value))
+        return (None, None)
+
+    def _record_snr_performance(self, correct_predictions, total_predictions):
+        """Cache aggregated accuracy for the current SNR level and model."""
+        if (not self.current_snr_level or
+                self.current_snr_level.get('value') is None or
+                total_predictions <= 0):
+            return
+
+        model_name = self.selected_model.get()
+        snr_label = self.current_snr_level['label']
+        snr_value = float(self.current_snr_level['value'])
+        accuracy_fraction = correct_predictions / total_predictions
+
+        entry = next((item for item in self.snr_degradation_data
+                      if item['model'] == model_name and item['snr_label'] == snr_label), None)
+
+        if entry:
+            entry.setdefault('correct', 0)
+            entry.setdefault('total', 0)
+            entry['correct'] += correct_predictions
+            entry['total'] += total_predictions
+            entry['accuracy'] = entry['correct'] / max(1, entry['total'])
+            entry['sessions'] = entry.get('sessions', 1) + 1
+            entry['updated'] = datetime.now()
+        else:
+            self.snr_degradation_data.append({
+                'model': model_name,
+                'snr_label': snr_label,
+                'snr_value': snr_value,
+                'accuracy': accuracy_fraction,
+                'correct': correct_predictions,
+                'total': total_predictions,
+                'sessions': 1,
+                'updated': datetime.now()
+            })
+
+        self.root.after(0, lambda acc=accuracy_fraction * 100, label=snr_label:
+                         self.add_prediction_log(
+                             f"📉 Recorded {label}: {acc:.2f}% accuracy aggregated.", "info"))
+        self._update_snr_analysis_display()
+        self.current_snr_level = None
+
+    def _build_snr_analysis_rows(self):
+        """Construct display rows for the SNR degradation table."""
+        if not self.snr_degradation_data:
+            return []
+        rows = []
+        data_by_model = {}
+        for entry in self.snr_degradation_data:
+            data_by_model.setdefault(entry['model'], []).append(entry)
+        for model_name, entries in data_by_model.items():
+            valid_entries = [e for e in entries if e.get('snr_value') is not None]
+            if not valid_entries:
+                continue
+            sorted_entries = sorted(valid_entries, key=lambda e: e['snr_value'], reverse=True)
+            baseline = sorted_entries[0]
+            base_value = baseline['snr_value']
+            base_label = baseline['snr_label']
+            base_accuracy = self._resolve_snr_accuracy(baseline)
+
+            rows.append({
+                'model': model_name,
+                'loss': 0.0,
+                'range': f"{base_label} (Baseline)",
+                'rate': 0.0,
+                'classification': 'Baseline reference'
+            })
+
+            if len(sorted_entries) == 1:
+                continue
+
+            for entry in sorted_entries[1:]:
+                entry_accuracy = self._resolve_snr_accuracy(entry)
+                delta_db = abs((base_value or 0) - (entry['snr_value'] or 0))
+                if delta_db == 0:
+                    delta_db = 1
+                accuracy_loss = (base_accuracy - entry_accuracy) * 100
+                rate = accuracy_loss / delta_db
+                snr_range = f"{base_label} to {entry['snr_label']}"
+                classification = self._classify_snr_rate(rate)
+                rows.append({
+                    'model': model_name,
+                    'loss': accuracy_loss,
+                    'range': snr_range,
+                    'rate': rate,
+                    'classification': classification
+                })
+        return rows
+
+    def _resolve_snr_accuracy(self, entry):
+        """Return accuracy fraction for a stored SNR entry."""
+        if entry.get('total'):
+            return entry.get('correct', 0) / max(1, entry['total'])
+        return entry.get('accuracy', 0.0)
+
+    def _classify_snr_rate(self, rate):
+        """Classify robustness based on degradation rate magnitude."""
+        magnitude = abs(rate)
+        if magnitude <= 0.5:
+            return "Highly Robust"
+        if magnitude <= 1.5:
+            return "Moderately Robust"
+        return "Needs Attention"
+
+    def _update_snr_analysis_display(self):
+        """Refresh SNR analysis table and helper message."""
+        if not hasattr(self, 'snr_tree') or self.snr_tree is None:
+            return
+        for row in self.snr_tree.get_children():
+            self.snr_tree.delete(row)
+        rows = self._build_snr_analysis_rows()
+        if rows:
+            for row in rows:
+                self.snr_tree.insert('', 'end', values=(
+                    row['model'],
+                    f"{row['loss']:.2f}%",
+                    row['range'],
+                    f"{row['rate']:.3f}",
+                    row['classification']
+                ))
+            if self.snr_empty_label and self.snr_empty_label.winfo_ismapped():
+                self.snr_empty_label.pack_forget()
+        else:
+            if self.snr_empty_label and not self.snr_empty_label.winfo_ismapped():
+                self.snr_empty_label.pack(fill='x', pady=(10, 0))
         
     def create_training_results_tab(self):
         """Create training results & export tab - similar to results tab but for training sessions"""
@@ -2304,14 +2996,10 @@ Final Accuracy: {accuracy:.2f}%
         
         train_res_canvas.create_window((0, 0), window=self.train_results_content, anchor="nw")
         train_res_canvas.configure(yscrollcommand=train_res_scrollbar.set)
-        
+        self._enable_mousewheel(train_res_canvas)
+
         train_res_canvas.pack(side="left", fill="both", expand=True)
         train_res_scrollbar.pack(side="right", fill="y")
-        
-        # Enable mouse wheel scrolling
-        def _on_mousewheel(event):
-            train_res_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        train_res_canvas.bind_all("<MouseWheel>", _on_mousewheel)
         
         # Export Controls
         export_frame = tk.LabelFrame(self.train_results_content, text="📤 Export Options", 
@@ -2566,26 +3254,27 @@ Final Accuracy: {accuracy:.2f}%
         
         self.train_res_history.config(state='disabled')
     
-    def export_training_to_pdf(self):
+    def export_training_to_pdf(self, filename=None, silent=False):
         """Export training results and hyperparameters to PDF"""
         if not self.current_training_session:
-            messagebox.showwarning("No Data", "No training session data to export!")
-            return
+            if silent:
+                self.add_training_log("⚠️ Cannot export PDF - no training session", "warning")
+            else:
+                messagebox.showwarning("No Data", "No training session data to export!")
+            return None
         
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".pdf",
-                filetypes=[("PDF files", "*.pdf")],
-                initialfile=f"Training_Report_{timestamp}.pdf"
-            )
-            
             if not filename:
-                return
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".pdf",
+                    filetypes=[("PDF files", "*.pdf")],
+                    initialfile=f"Training_Report_{timestamp}.pdf"
+                )
+                if not filename:
+                    return None
             
             session = self.current_training_session
-            session_metrics = session.get('metrics') or self.training_metrics or {}
-            session_hyperparams = session.get('hyperparameters') or self.training_hyperparameters or {}
             session_metrics = session.get('metrics') or self.training_metrics or {}
             session_hyperparams = session.get('hyperparameters') or self.training_hyperparameters or {}
 
@@ -2729,29 +3418,42 @@ Final Accuracy: {accuracy:.2f}%
                         pdf.savefig(fig, bbox_inches='tight')
                         plt.close()
             
-            messagebox.showinfo("Success", f"Training report exported successfully to:\n{filename}")
+            if silent:
+                self.add_training_log(f"📄 Training PDF saved to {filename}", "success")
+            else:
+                messagebox.showinfo("Success", f"Training report exported successfully to:\n{filename}")
+            return filename
             
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export PDF:\n{str(e)}")
+            if silent:
+                self.add_training_log(f"❌ Failed to export PDF: {e}", "error")
+            else:
+                messagebox.showerror("Export Error", f"Failed to export PDF:\n{str(e)}")
+            return None
     
-    def export_training_to_csv(self):
+    def export_training_to_csv(self, filename=None, silent=False):
         """Export training results to CSV"""
         if not self.current_training_session:
-            messagebox.showwarning("No Data", "No training session data to export!")
-            return
+            if silent:
+                self.add_training_log("⚠️ Cannot export CSV - no training session", "warning")
+            else:
+                messagebox.showwarning("No Data", "No training session data to export!")
+            return None
         
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv")],
-                initialfile=f"Training_Results_{timestamp}.csv"
-            )
-            
             if not filename:
-                return
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".csv",
+                    filetypes=[("CSV files", "*.csv")],
+                    initialfile=f"Training_Results_{timestamp}.csv"
+                )
+                if not filename:
+                    return None
             
             session = self.current_training_session
+            session_metrics = session.get('metrics') or self.training_metrics or {}
+            session_hyperparams = session.get('hyperparameters') or self.training_hyperparameters or {}
             
             with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
@@ -2834,10 +3536,18 @@ Final Accuracy: {accuracy:.2f}%
                             hist_session.get('saved_filename', 'Not saved')
                         ])
             
-            messagebox.showinfo("Success", f"Training results exported successfully to:\n{filename}")
+            if silent:
+                self.add_training_log(f"📊 Training CSV saved to {filename}", "success")
+            else:
+                messagebox.showinfo("Success", f"Training results exported successfully to:\n{filename}")
+            return filename
             
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export CSV:\n{str(e)}")
+            if silent:
+                self.add_training_log(f"❌ Failed to export CSV: {e}", "error")
+            else:
+                messagebox.showerror("Export Error", f"Failed to export CSV:\n{str(e)}")
+            return None
     
     # In gui.py
     def auto_load_models(self):
@@ -2999,6 +3709,8 @@ Final Accuracy: {accuracy:.2f}%
             
     def update_animations(self):
         """Update various animations"""
+        if not self._running or not (self.root and self.root.winfo_exists()):
+            return
         # Animate header pulsing effect
         self.animation_frame += self.pulse_direction
         if self.animation_frame >= 20:
@@ -3016,10 +3728,12 @@ Final Accuracy: {accuracy:.2f}%
                 self.status_title.config(font=('Arial', 19, 'bold'))
         
         # Schedule next animation update
-        self.root.after(100, self.update_animations)
+        self._animation_job = self.root.after(100, self.update_animations)
         
     def update_simulation_display(self):
         """Update simulation displays periodically"""
+        if not self._running or not (self.root and self.root.winfo_exists()):
+            return
         # Simulate system resource usage
         if self.is_processing:
             cpu_usage = random.uniform(60, 90)
@@ -3036,12 +3750,45 @@ Final Accuracy: {accuracy:.2f}%
             self.memory_label.config(text=f"{memory_usage:.0f} MB")
         
         # Schedule next update
-        self.root.after(1000, self.update_simulation_display)
+        self._sim_job = self.root.after(1000, self.update_simulation_display)
         
     def update_logs(self):
         """Update log display"""
+        if not self._running or not (self.root and self.root.winfo_exists()):
+            return
         # Process any queued log messages
-        self.root.after(100, self.update_logs)
+        self._log_job = self.root.after(100, self.update_logs)
+
+    def on_close(self):
+        """Gracefully shut down background work and close the window."""
+        if not self._running:
+            return
+
+        self._running = False
+
+        if self.is_processing:
+            try:
+                self.stop_simulation()
+            except Exception:
+                pass
+        self.is_processing = False
+
+        for job_attr in ('_animation_job', '_sim_job', '_log_job'):
+            job_id = getattr(self, job_attr, None)
+            if job_id and self.root:
+                try:
+                    self.root.after_cancel(job_id)
+                except Exception:
+                    pass
+                finally:
+                    setattr(self, job_attr, None)
+
+        prediction_thread = getattr(self, '_prediction_thread', None)
+        if prediction_thread and prediction_thread.is_alive():
+            prediction_thread.join(timeout=2.0)
+
+        if self.root and self.root.winfo_exists():
+            self.root.destroy()
     
     def create_explainability_tab(self):
         """Create explainability tab for tree model interpretability"""
@@ -3073,6 +3820,7 @@ Final Accuracy: {accuracy:.2f}%
         
         explain_canvas.create_window((0, 0), window=self.explain_content, anchor="nw")
         explain_canvas.configure(yscrollcommand=explain_scrollbar.set)
+        self._enable_mousewheel(explain_canvas)
         
         explain_canvas.pack(side="left", fill="both", expand=True)
         explain_scrollbar.pack(side="right", fill="y")
@@ -4095,265 +4843,290 @@ Dataset: {self.selected_dataset.get()}
             import traceback
             traceback.print_exc()
     
-    def export_to_pdf(self):
+    def export_to_pdf(self, filename=None, silent=False):
         """Export comprehensive analysis to PDF"""
         if self.total_predictions == 0:
-            messagebox.showwarning("No Data", "No prediction data available to export!")
-            return
+            if silent:
+                self.add_prediction_log("⚠️ Skipping PDF export - no prediction data", "warning")
+            else:
+                messagebox.showwarning("No Data", "No prediction data available to export!")
+            return None
         
         try:
-            # Ask for save location
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".pdf",
-                filetypes=[("PDF files", "*.pdf")],
-                initialfile=f"Audio_Classification_Report_{timestamp}.pdf"
-            )
-            
             if not filename:
-                return
-            
-            # Create PDF with matplotlib
-            with PdfPages(filename) as pdf:
-                # Page 1: Summary and Metrics
-                fig = plt.figure(figsize=(11, 8.5))
-                fig.suptitle('Audio Classification Analysis Report', fontsize=20, weight='bold')
-                
-                # Add metadata
-                report_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
-                plt.figtext(0.5, 0.92, f'Generated: {report_date}', ha='center', fontsize=10)
-                
-                # Session Information
-                ax1 = plt.subplot(3, 2, 1)
-                ax1.axis('off')
-                session_info = f"""
-SESSION INFORMATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Model: {self.selected_model.get()}
-Dataset: {self.selected_dataset.get()}
-Total Predictions: {self.total_predictions}
-Date: {report_date}
-                """
-                ax1.text(0.1, 0.5, session_info, fontsize=11, family='monospace',
-                        verticalalignment='center')
-                
-                # Performance Metrics with Confusion Matrix
-                ax2 = plt.subplot(3, 2, 2)
-                ax2.axis('off')
-                accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
-                
-                # Calculate precision, recall, F1
-                precision = (self.true_positives / (self.true_positives + self.false_positives) * 100) if (self.true_positives + self.false_positives) > 0 else 0
-                recall = (self.true_positives / (self.true_positives + self.false_negatives) * 100) if (self.true_positives + self.false_negatives) > 0 else 0
-                
-                if precision > 0 and recall > 0:
-                    f1 = 2 * (precision * recall) / (precision + recall)
-                else:
-                    f1 = 0
-                
-                metrics_info = (
-                    "PERFORMANCE METRICS\n"
-                    "--------------------\n"
-                    f"Correct: {self.correct_predictions}\n"
-                    f"Incorrect: {self.total_predictions - self.correct_predictions}\n"
-                    f"Accuracy: {accuracy:.2f}%\n\n"
-                    "CONFUSION MATRIX\n"
-                    "--------------------\n"
-                    f"True Positives:  {self.true_positives}\n"
-                    f"False Positives: {self.false_positives}\n"
-                    f"True Negatives:  {self.true_negatives}\n"
-                    f"False Negatives: {self.false_negatives}\n\n"
-                    "DETAILED METRICS\n"
-                    "--------------------\n"
-                    f"Precision: {precision:.2f}%\n"
-                    f"Recall:    {recall:.2f}%\n"
-                    f"F1-Score:  {f1:.2f}%\n"
+                # Ask for save location
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".pdf",
+                    filetypes=[("PDF files", "*.pdf")],
+                    initialfile=f"Audio_Classification_Report_{timestamp}.pdf"
                 )
-                ax2.text(0.1, 0.5, metrics_info, fontsize=9, family='monospace',
-                        verticalalignment='center')
                 
-                # Accuracy Chart
-                ax3 = plt.subplot(3, 2, (3, 4))
-                if len(self.prediction_history) > 0:
-                    running_accuracy = []
-                    correct_count = 0
-                    for i, pred in enumerate(self.prediction_history):
-                        if pred['correct']:
-                            correct_count += 1
-                        running_accuracy.append(correct_count / (i + 1))
-                    
-                    sample_numbers = list(range(1, len(running_accuracy) + 1))
-                    ax3.plot(sample_numbers, running_accuracy, 'b-', linewidth=2)
-                    ax3.fill_between(sample_numbers, running_accuracy, alpha=0.3)
-                    ax3.set_xlabel('Prediction Number', fontsize=10)
-                    ax3.set_ylabel('Running Accuracy', fontsize=10)
-                    ax3.set_title('Running Accuracy Over Time', fontsize=12, weight='bold')
-                    ax3.grid(True, alpha=0.3)
-                    ax3.set_ylim(0, 1)
-                
-                # Confidence Distribution
-                ax4 = plt.subplot(3, 2, (5, 6))
-                if len(self.prediction_history) > 0:
-                    confidences = [pred['confidence'] for pred in self.prediction_history]
-                    colors = ['green' if pred['correct'] else 'red' for pred in self.prediction_history]
-                    sample_nums = list(range(1, len(confidences) + 1))
-                    ax4.bar(sample_nums, confidences, color=colors, alpha=0.6)
-                    ax4.axhline(y=0.5, color='orange', linestyle='--', linewidth=2, label='Threshold')
-                    ax4.set_xlabel('Prediction Number', fontsize=10)
-                    ax4.set_ylabel('Confidence', fontsize=10)
-                    ax4.set_title('Prediction Confidence Distribution', fontsize=12, weight='bold')
-                    ax4.legend()
-                    ax4.grid(True, alpha=0.3)
-                    ax4.set_ylim(0, 1)
-                
-                plt.tight_layout(rect=[0, 0, 1, 0.96])
-                pdf.savefig(fig)
-                plt.close(fig)
-                
-                # Page 2: Detailed Prediction Table (if we have data)
-                if len(self.prediction_history) > 0:
-                    fig2 = plt.figure(figsize=(11, 8.5))
-                    fig2.suptitle('Detailed Prediction Results', fontsize=16, weight='bold')
-                    ax = fig2.add_subplot(111)
-                    ax.axis('off')
-                    
-                    # Create table data
-                    table_data = [['#', 'Actual', 'Predicted', 'Confidence', 'Result']]
-                    for i, pred in enumerate(self.prediction_history[:50], 1):  # First 50 predictions
-                        actual = 'Real' if pred['actual'] == 1 else 'Fake'
-                        predicted = 'Real' if pred['predicted'] == 1 else 'Fake'
-                        confidence = f"{pred['confidence']:.2%}"
-                        result = 'Correct' if pred['correct'] else 'Wrong'
-                        table_data.append([str(i), actual, predicted, confidence, result])
-                    
-                    # Create table
-                    table = ax.table(cellText=table_data, cellLoc='center', loc='center',
-                                   colWidths=[0.1, 0.2, 0.2, 0.2, 0.2])
-                    table.auto_set_font_size(False)
-                    table.set_fontsize(9)
-                    table.scale(1, 2)
-                    
-                    # Style header row
-                    for i in range(5):
-                        table[(0, i)].set_facecolor('#3498db')
-                        table[(0, i)].set_text_props(weight='bold', color='white')
-                    
-                    # Color code results
-                    for i in range(1, len(table_data)):
-                        if table_data[i][4] == 'Correct':
-                            table[(i, 4)].set_facecolor('#d5f4e6')
-                        else:
-                            table[(i, 4)].set_facecolor('#fadbd8')
-                    
-                    plt.figtext(0.5, 0.95, f'Showing first 50 of {len(self.prediction_history)} predictions',
-                              ha='center', fontsize=10)
-                    
-                    pdf.savefig(fig2)
-                    plt.close(fig2)
-                
-                # Page 3: Detailed Classification Report
-                if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
-                    fig3 = plt.figure(figsize=(11, 8.5))
-                    fig3.suptitle('Detailed Classification Report', fontsize=16, weight='bold')
-                    ax = fig3.add_subplot(111)
-                    ax.axis('off')
-                    
-                    # Classification report text
-                    y_pos = 0.85
-                    fig3.text(0.5, y_pos, 'PER-CLASS METRICS', ha='center', fontsize=14, weight='bold')
-                    y_pos -= 0.05
-                    
-                    # Table header
-                    fig3.text(0.15, y_pos, 'Class', fontsize=12, weight='bold')
-                    fig3.text(0.35, y_pos, 'Precision', fontsize=12, weight='bold')
-                    fig3.text(0.5, y_pos, 'Recall', fontsize=12, weight='bold')
-                    fig3.text(0.65, y_pos, 'F1-Score', fontsize=12, weight='bold')
-                    fig3.text(0.8, y_pos, 'Support', fontsize=12, weight='bold')
-                    y_pos -= 0.03
-                    
-                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig3.transFigure, clip_on=False)
-                    y_pos -= 0.02
-                    
-                    # Class 0
-                    fig3.text(0.15, y_pos, 'Class 0 (Fake)', fontsize=11)
-                    fig3.text(0.35, y_pos, f"{self.classification_report['class_0']['precision']:.4f}", fontsize=11)
-                    fig3.text(0.5, y_pos, f"{self.classification_report['class_0']['recall']:.4f}", fontsize=11)
-                    fig3.text(0.65, y_pos, f"{self.classification_report['class_0']['f1-score']:.4f}", fontsize=11)
-                    fig3.text(0.8, y_pos, f"{int(self.classification_report['class_0']['support'])}", fontsize=11)
-                    y_pos -= 0.04
-                    
-                    # Class 1
-                    fig3.text(0.15, y_pos, 'Class 1 (Real)', fontsize=11)
-                    fig3.text(0.35, y_pos, f"{self.classification_report['class_1']['precision']:.4f}", fontsize=11)
-                    fig3.text(0.5, y_pos, f"{self.classification_report['class_1']['recall']:.4f}", fontsize=11)
-                    fig3.text(0.65, y_pos, f"{self.classification_report['class_1']['f1-score']:.4f}", fontsize=11)
-                    fig3.text(0.8, y_pos, f"{int(self.classification_report['class_1']['support'])}", fontsize=11)
-                    y_pos -= 0.02
-                    
-                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig3.transFigure, clip_on=False)
-                    y_pos -= 0.02
-                    
-                    # Accuracy
-                    fig3.text(0.15, y_pos, 'Accuracy', fontsize=11, weight='bold')
-                    fig3.text(0.65, y_pos, f"{self.classification_report['accuracy']:.4f}", fontsize=11, weight='bold')
-                    total_support = int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support'])
-                    fig3.text(0.8, y_pos, f"{total_support}", fontsize=11, weight='bold')
-                    y_pos -= 0.04
-                    
-                    # Macro Avg
-                    fig3.text(0.15, y_pos, 'Macro Avg', fontsize=11)
-                    fig3.text(0.35, y_pos, f"{self.classification_report['macro_avg']['precision']:.4f}", fontsize=11)
-                    fig3.text(0.5, y_pos, f"{self.classification_report['macro_avg']['recall']:.4f}", fontsize=11)
-                    fig3.text(0.65, y_pos, f"{self.classification_report['macro_avg']['f1-score']:.4f}", fontsize=11)
-                    fig3.text(0.8, y_pos, f"{total_support}", fontsize=11)
-                    y_pos -= 0.04
-                    
-                    # Weighted Avg
-                    fig3.text(0.15, y_pos, 'Weighted Avg', fontsize=11)
-                    fig3.text(0.35, y_pos, f"{self.classification_report['weighted_avg']['precision']:.4f}", fontsize=11)
-                    fig3.text(0.5, y_pos, f"{self.classification_report['weighted_avg']['recall']:.4f}", fontsize=11)
-                    fig3.text(0.65, y_pos, f"{self.classification_report['weighted_avg']['f1-score']:.4f}", fontsize=11)
-                    fig3.text(0.8, y_pos, f"{total_support}", fontsize=11)
-                    y_pos -= 0.08
-                    
-                    # Training metrics if available
-                    if self.training_start_time and self.training_duration > 0:
-                        fig3.text(0.5, y_pos, 'TRAINING PERFORMANCE', ha='center', fontsize=14, weight='bold')
-                        y_pos -= 0.05
-                        fig3.text(0.15, y_pos, f"Start Time: {self.training_start_time.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=11)
-                        y_pos -= 0.04
-                        fig3.text(0.15, y_pos, f"Duration: {self.training_duration:.2f} sec ({self.training_duration/60:.2f} min)", fontsize=11)
-                        y_pos -= 0.04
-                        fig3.text(0.15, y_pos, f"Peak Memory: {self.peak_memory_mb:.2f} MB", fontsize=11, weight='bold')
-                        y_pos -= 0.04
-                        fig3.text(0.15, y_pos, f"Avg Memory: {self.avg_memory_mb:.2f} MB", fontsize=11)
-                    
-                    pdf.savefig(fig3)
-                    plt.close(fig3)
+                if not filename:
+                    return None
             
-            messagebox.showinfo("Export Successful", 
-                              f"Report exported successfully to:\n{filename}")
+            # Force a light theme so dark UI styles do not bleed into the export
+            light_theme = {
+                'axes.facecolor': '#ffffff',
+                'figure.facecolor': '#ffffff',
+                'savefig.facecolor': '#ffffff',
+                'savefig.edgecolor': '#ffffff',
+                'text.color': '#0b0b0b',
+                'axes.edgecolor': '#0b0b0b',
+                'axes.labelcolor': '#0b0b0b',
+                'xtick.color': '#0b0b0b',
+                'ytick.color': '#0b0b0b',
+                'grid.color': '#d9d9d9',
+                'font.size': 10,
+            }
+
+            with plt.rc_context(light_theme):
+                with PdfPages(filename) as pdf:
+                    # Page 1: Summary and Metrics
+                    fig = plt.figure(figsize=(11, 8.5))
+                    fig.patch.set_facecolor('#ffffff')
+                    fig.suptitle('Audio Classification Analysis Report', fontsize=20, weight='bold', color='#0b0b0b')
+
+                    report_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+                    plt.figtext(0.5, 0.92, f'Generated: {report_date}', ha='center', fontsize=10, color='#0b0b0b')
+
+                    ax1 = plt.subplot(3, 2, 1)
+                    ax1.axis('off')
+                    session_info = (
+                        "SESSION INFORMATION\n"
+                        "------------------------------\n"
+                        f"Model: {self.selected_model.get()}\n"
+                        f"Dataset: {self.selected_dataset.get()}\n"
+                        f"Total Predictions: {self.total_predictions}\n"
+                        f"Date: {report_date}\n"
+                    )
+                    ax1.text(0.1, 0.5, session_info, fontsize=11, family='monospace',
+                             verticalalignment='center', color='#0b0b0b')
+
+                    ax2 = plt.subplot(3, 2, 2)
+                    ax2.axis('off')
+                    accuracy = (self.correct_predictions / self.total_predictions * 100) if self.total_predictions > 0 else 0
+                    precision = (self.true_positives / (self.true_positives + self.false_positives) * 100) if (self.true_positives + self.false_positives) > 0 else 0
+                    recall = (self.true_positives / (self.true_positives + self.false_negatives) * 100) if (self.true_positives + self.false_negatives) > 0 else 0
+                    f1 = 2 * (precision * recall) / (precision + recall) if precision > 0 and recall > 0 else 0
+                    metrics_info = (
+                        "PERFORMANCE METRICS\n"
+                        "--------------------\n"
+                        f"Correct: {self.correct_predictions}\n"
+                        f"Incorrect: {self.total_predictions - self.correct_predictions}\n"
+                        f"Accuracy: {accuracy:.2f}%\n\n"
+                        "CONFUSION MATRIX\n"
+                        "--------------------\n"
+                        f"True Positives:  {self.true_positives}\n"
+                        f"False Positives: {self.false_positives}\n"
+                        f"True Negatives:  {self.true_negatives}\n"
+                        f"False Negatives: {self.false_negatives}\n\n"
+                        "DETAILED METRICS\n"
+                        "--------------------\n"
+                        f"Precision: {precision:.2f}%\n"
+                        f"Recall:    {recall:.2f}%\n"
+                        f"F1-Score:  {f1:.2f}%\n"
+                    )
+                    ax2.text(0.1, 0.5, metrics_info, fontsize=9, family='monospace',
+                             verticalalignment='center', color='#0b0b0b')
+
+                    ax3 = plt.subplot(3, 2, (3, 4))
+                    ax3.set_facecolor('#ffffff')
+                    if self.prediction_history:
+                        running_accuracy = []
+                        correct_count = 0
+                        for i, pred in enumerate(self.prediction_history):
+                            if pred['correct']:
+                                correct_count += 1
+                            running_accuracy.append(correct_count / (i + 1))
+                        sample_numbers = list(range(1, len(running_accuracy) + 1))
+                        ax3.plot(sample_numbers, running_accuracy, color='#2563eb', linewidth=2)
+                        ax3.fill_between(sample_numbers, running_accuracy, color='#93c5fd', alpha=0.5)
+                        ax3.set_xlabel('Prediction Number', fontsize=10)
+                        ax3.set_ylabel('Running Accuracy', fontsize=10)
+                        ax3.set_title('Running Accuracy Over Time', fontsize=12, weight='bold')
+                        ax3.grid(True, alpha=0.3)
+                        ax3.set_ylim(0, 1)
+
+                    ax4 = plt.subplot(3, 2, (5, 6))
+                    ax4.set_facecolor('#ffffff')
+                    if self.prediction_history:
+                        confidences = [pred['confidence'] for pred in self.prediction_history]
+                        colors = ['#16a34a' if pred['correct'] else '#dc2626' for pred in self.prediction_history]
+                        sample_nums = list(range(1, len(confidences) + 1))
+                        ax4.bar(sample_nums, confidences, color=colors, alpha=0.7, edgecolor='#333333')
+                        ax4.axhline(y=0.5, color='#f59e0b', linestyle='--', linewidth=2, label='Threshold')
+                        ax4.set_xlabel('Prediction Number', fontsize=10)
+                        ax4.set_ylabel('Confidence', fontsize=10)
+                        ax4.set_title('Prediction Confidence Distribution', fontsize=12, weight='bold')
+                        ax4.legend()
+                        ax4.grid(True, alpha=0.3)
+                        ax4.set_ylim(0, 1)
+
+                    plt.tight_layout(rect=[0, 0, 1, 0.96])
+                    pdf.savefig(fig)
+                    plt.close(fig)
+
+                    # Page 2: Detailed Prediction Table
+                    if self.prediction_history:
+                        fig2 = plt.figure(figsize=(11, 8.5))
+                        fig2.patch.set_facecolor('#ffffff')
+                        fig2.suptitle('Detailed Prediction Results', fontsize=16, weight='bold', color='#0b0b0b')
+                        ax = fig2.add_subplot(111)
+                        ax.axis('off')
+
+                        table_data = [['#', 'Actual', 'Predicted', 'Confidence', 'Result']]
+                        for i, pred in enumerate(self.prediction_history[:50], 1):
+                            actual = 'Real' if pred['actual'] == 1 else 'Fake'
+                            predicted = 'Real' if pred['predicted'] == 1 else 'Fake'
+                            confidence = f"{pred['confidence']:.2%}"
+                            result = 'Correct' if pred['correct'] else 'Wrong'
+                            table_data.append([str(i), actual, predicted, confidence, result])
+
+                        table = ax.table(cellText=table_data, cellLoc='center', loc='center',
+                                         colWidths=[0.1, 0.2, 0.2, 0.2, 0.2])
+                        table.auto_set_font_size(False)
+                        table.set_fontsize(9)
+                        table.scale(1, 2)
+                        for col_idx in range(5):
+                            table[(0, col_idx)].set_facecolor('#2563eb')
+                            table[(0, col_idx)].set_text_props(weight='bold', color='#ffffff')
+                        for row_idx in range(1, len(table_data)):
+                            facecolor = '#e9f7ef' if table_data[row_idx][4] == 'Correct' else '#fdecea'
+                            table[(row_idx, 4)].set_facecolor(facecolor)
+
+                        plt.figtext(0.5, 0.95, f'Showing first 50 of {len(self.prediction_history)} predictions',
+                                    ha='center', fontsize=10, color='#0b0b0b')
+                        pdf.savefig(fig2)
+                        plt.close(fig2)
+
+                    # Page 3: Classification Report
+                    if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
+                        fig3 = plt.figure(figsize=(11, 8.5))
+                        fig3.patch.set_facecolor('#ffffff')
+                        fig3.suptitle('Detailed Classification Report', fontsize=16, weight='bold', color='#0b0b0b')
+                        ax = fig3.add_subplot(111)
+                        ax.axis('off')
+
+                        y_pos = 0.85
+                        fig3.text(0.5, y_pos, 'PER-CLASS METRICS', ha='center', fontsize=14, weight='bold', color='#0b0b0b')
+                        y_pos -= 0.05
+                        headers = [('Class', 0.15), ('Precision', 0.35), ('Recall', 0.5), ('F1-Score', 0.65), ('Support', 0.8)]
+                        for label, x in headers:
+                            fig3.text(x, y_pos, label, fontsize=12, weight='bold', color='#0b0b0b')
+                        y_pos -= 0.03
+                        plt.plot([0.1, 0.9], [y_pos, y_pos], color='#888888', linewidth=1, transform=fig3.transFigure, clip_on=False)
+                        y_pos -= 0.02
+
+                        for class_key, class_label in (('class_0', 'Class 0 (Fake)'), ('class_1', 'Class 1 (Real)')):
+                            fig3.text(0.15, y_pos, class_label, fontsize=11, color='#0b0b0b')
+                            fig3.text(0.35, y_pos, f"{self.classification_report[class_key]['precision']:.4f}", fontsize=11, color='#0b0b0b')
+                            fig3.text(0.5, y_pos, f"{self.classification_report[class_key]['recall']:.4f}", fontsize=11, color='#0b0b0b')
+                            fig3.text(0.65, y_pos, f"{self.classification_report[class_key]['f1-score']:.4f}", fontsize=11, color='#0b0b0b')
+                            fig3.text(0.8, y_pos, f"{int(self.classification_report[class_key]['support'])}", fontsize=11, color='#0b0b0b')
+                            y_pos -= 0.04
+                        plt.plot([0.1, 0.9], [y_pos, y_pos], color='#d9d9d9', linewidth=1, transform=fig3.transFigure, clip_on=False)
+                        y_pos -= 0.02
+
+                        total_support = int(self.classification_report['class_0']['support'] + self.classification_report['class_1']['support'])
+                        fig3.text(0.15, y_pos, 'Accuracy', fontsize=11, weight='bold', color='#0b0b0b')
+                        fig3.text(0.65, y_pos, f"{self.classification_report['accuracy']:.4f}", fontsize=11, weight='bold', color='#0b0b0b')
+                        fig3.text(0.8, y_pos, f"{total_support}", fontsize=11, weight='bold', color='#0b0b0b')
+                        y_pos -= 0.04
+
+                        for label, key in (('Macro Avg', 'macro_avg'), ('Weighted Avg', 'weighted_avg')):
+                            fig3.text(0.15, y_pos, label, fontsize=11, color='#0b0b0b')
+                            fig3.text(0.35, y_pos, f"{self.classification_report[key]['precision']:.4f}", fontsize=11, color='#0b0b0b')
+                            fig3.text(0.5, y_pos, f"{self.classification_report[key]['recall']:.4f}", fontsize=11, color='#0b0b0b')
+                            fig3.text(0.65, y_pos, f"{self.classification_report[key]['f1-score']:.4f}", fontsize=11, color='#0b0b0b')
+                            fig3.text(0.8, y_pos, f"{total_support}", fontsize=11, color='#0b0b0b')
+                            y_pos -= 0.04
+
+                        if self.training_start_time and self.training_duration > 0:
+                            y_pos -= 0.02
+                            fig3.text(0.5, y_pos, 'TRAINING PERFORMANCE', ha='center', fontsize=14, weight='bold', color='#0b0b0b')
+                            y_pos -= 0.05
+                            fig3.text(0.15, y_pos, f"Start Time: {self.training_start_time.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=11, color='#0b0b0b')
+                            y_pos -= 0.04
+                            fig3.text(0.15, y_pos, f"Duration: {self.training_duration:.2f} sec ({self.training_duration/60:.2f} min)", fontsize=11, color='#0b0b0b')
+                            y_pos -= 0.04
+                            fig3.text(0.15, y_pos, f"Peak Memory: {self.peak_memory_mb:.2f} MB", fontsize=11, weight='bold', color='#0b0b0b')
+                            y_pos -= 0.04
+                            fig3.text(0.15, y_pos, f"Avg Memory: {self.avg_memory_mb:.2f} MB", fontsize=11, color='#0b0b0b')
+
+                        pdf.savefig(fig3)
+                        plt.close(fig3)
+
+                    # Page 4: SNR Degradation Table
+                    snr_rows = self._build_snr_analysis_rows()
+                    if snr_rows:
+                        fig4 = plt.figure(figsize=(11, 8.5))
+                        fig4.patch.set_facecolor('#ffffff')
+                        fig4.suptitle('SNR Degradation Analysis', fontsize=16, weight='bold', color='#0b0b0b')
+                        ax = fig4.add_subplot(111)
+                        ax.axis('off')
+
+                        table_data = [['Model', 'Total Accuracy Loss', 'SNR Range', 'Degradation Rate (%/dB)', 'Classification']]
+                        for row in snr_rows:
+                            table_data.append([
+                                row['model'],
+                                f"{row['loss']:.2f}%",
+                                row['range'],
+                                f"{row['rate']:.3f}",
+                                row['classification']
+                            ])
+
+                        table = ax.table(
+                            cellText=table_data,
+                            cellLoc='center',
+                            loc='center',
+                            colWidths=[0.2, 0.2, 0.25, 0.2, 0.15]
+                        )
+                        table.auto_set_font_size(False)
+                        table.set_fontsize(10)
+                        table.scale(1, 1.5)
+                        for col_idx in range(len(table_data[0])):
+                            table[(0, col_idx)].set_facecolor('#0f4c81')
+                            table[(0, col_idx)].set_text_props(color='#ffffff', weight='bold')
+
+                        pdf.savefig(fig4)
+                        plt.close(fig4)
+            
+            if silent:
+                self.add_prediction_log(f"📄 Prediction PDF saved to {filename}", "success")
+            else:
+                messagebox.showinfo("Export Successful", 
+                                  f"Report exported successfully to:\n{filename}")
+            return filename
             
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export PDF:\n{str(e)}")
+            if silent:
+                self.add_prediction_log(f"❌ Failed to export PDF: {e}", "error")
+            else:
+                messagebox.showerror("Export Error", f"Failed to export PDF:\n{str(e)}")
+            return None
     
-    def export_to_csv(self):
+    def export_to_csv(self, filename=None, silent=False):
         """Export detailed prediction results to CSV"""
         if self.total_predictions == 0:
-            messagebox.showwarning("No Data", "No prediction data available to export!")
-            return
+            if silent:
+                self.add_prediction_log("⚠️ Skipping CSV export - no prediction data", "warning")
+            else:
+                messagebox.showwarning("No Data", "No prediction data available to export!")
+            return None
         
         try:
-            # Ask for save location
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV files", "*.csv")],
-                initialfile=f"Audio_Classification_Results_{timestamp}.csv"
-            )
-            
             if not filename:
-                return
+                # Ask for save location
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = filedialog.asksaveasfilename(
+                    defaultextension=".csv",
+                    filetypes=[("CSV files", "*.csv")],
+                    initialfile=f"Audio_Classification_Results_{timestamp}.csv"
+                )
+                
+                if not filename:
+                    return None
             
             # Write CSV
             with open(filename, 'w', newline='', encoding='utf-8') as f:
@@ -4471,11 +5244,19 @@ Date: {report_date}
                     
                     writer.writerow([i, actual, predicted, confidence, result, dataset_info])
             
-            messagebox.showinfo("Export Successful", 
-                              f"Results exported successfully to:\n{filename}")
+            if silent:
+                self.add_prediction_log(f"📊 Prediction CSV saved to {filename}", "success")
+            else:
+                messagebox.showinfo("Export Successful", 
+                                  f"Results exported successfully to:\n{filename}")
+            return filename
             
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export CSV:\n{str(e)}")
+            if silent:
+                self.add_prediction_log(f"❌ Failed to export CSV: {e}", "error")
+            else:
+                messagebox.showerror("Export Error", f"Failed to export CSV:\n{str(e)}")
+            return None
     
     def export_summary_txt(self):
         """Export comprehensive summary as formatted text file"""

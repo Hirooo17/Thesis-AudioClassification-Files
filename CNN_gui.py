@@ -5,7 +5,8 @@ Shows epoch-by-epoch training progress, loss curves, and detailed metrics
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+import queue
 import threading
 import time
 import numpy as np
@@ -13,10 +14,12 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 import sys
 import os
 import pickle
 import csv
+import re
 from matplotlib.backends.backend_pdf import PdfPages
 import psutil
 import cv2
@@ -143,6 +146,18 @@ class CNNTrainingGUI:
             'mixed_datasets': [],
             'total_samples': {'train': 0, 'val': 0, 'test': 0}
         }
+
+        # Automated SNR workflow state
+        self.auto_training_active = False
+        self.auto_training_queue = []
+        self.auto_training_output_dir = None
+        self.auto_training_status_label = None
+        self.auto_training_current = None
+
+        self.auto_prediction_active = False
+        self.auto_prediction_queue = []
+        self.auto_prediction_output_dir = None
+        self.auto_prediction_status_label = None
         
         # CNN model directory
         self.cnn_model_dir = os.path.join(os.path.dirname(__file__), 'CNN')
@@ -166,6 +181,17 @@ class CNNTrainingGUI:
         
         # Create GUI
         self.create_widgets()
+
+        # Thread-safe logging and UI queues
+        self.training_log_queue = queue.Queue()
+        self.prediction_log_queue = queue.Queue()
+        self.explain_log_queue = queue.Queue()
+        self.ui_task_queue = queue.Queue()
+
+        self.root.after(100, self._process_training_log_queue)
+        self.root.after(100, self._process_prediction_log_queue)
+        self.root.after(100, self._process_explain_log_queue)
+        self.root.after(50, self._process_ui_tasks)
         
     def create_widgets(self):
         """Create all GUI widgets"""
@@ -203,6 +229,10 @@ class CNNTrainingGUI:
         self.setup_model_manager_tab()
         self.setup_optimization_tab()
         self.setup_explainability_tab()
+
+    def _enable_text_mousewheel(self, widget):
+        """Ensure mouse wheel works when hovering over text widgets."""
+        widget.bind("<Enter>", lambda _: widget.focus_set())
         
     def setup_training_tab(self):
         """Setup training tab with epoch tracking"""
@@ -269,6 +299,24 @@ class CNNTrainingGUI:
                                   bg='#ff6b6b', fg='white', font=('Arial', 12, 'bold'), 
                                   width=15, height=2, state='disabled', cursor='hand2')
         self.stop_btn.pack(padx=5, pady=5)
+
+        # Auto SNR Training controls
+        auto_train_frame = tk.LabelFrame(self.training_tab, text=" 🤖 Auto SNR Training ",
+                         fg='white', bg='#2a2a2a', font=('Arial', 10, 'bold'))
+        auto_train_frame.pack(fill='x', padx=10, pady=5)
+
+        tk.Label(auto_train_frame,
+             text="Run every available SNR dataset sequentially. The current selection is used as the starting level.",
+             fg='#ecf0f1', bg='#2a2a2a', font=('Arial', 10), wraplength=900, justify='left').pack(anchor='w', padx=10, pady=(5, 0))
+
+        status_row = tk.Frame(auto_train_frame, bg='#2a2a2a')
+        status_row.pack(fill='x', padx=10, pady=5)
+        tk.Label(status_row, text="Status:", fg='#cccccc', bg='#2a2a2a', font=('Arial', 10, 'bold')).pack(side='left')
+        self.auto_training_status_label = tk.Label(status_row, text="Idle", fg='#95a5a6', bg='#2a2a2a', font=('Arial', 10))
+        self.auto_training_status_label.pack(side='left', padx=6)
+
+        tk.Button(auto_train_frame, text="⚡ Start Auto SNR Training", command=self.start_auto_snr_training,
+              bg='#e67e22', fg='white', font=('Arial', 11, 'bold'), width=30, cursor='hand2').pack(pady=(0, 8))
         
         # Progress Section
         progress_frame = tk.Frame(self.training_tab, bg='#2a2a2a', relief='ridge', bd=2)
@@ -349,13 +397,17 @@ class CNNTrainingGUI:
                                  fg='white', bg='#2a2a2a', font=('Arial', 10, 'bold'))
         log_frame.pack(fill='both', padx=10, pady=10, expand=True)
         
-        self.training_log = tk.Text(log_frame, height=10, bg='#1a1a1a', fg='#00ff88', 
-                                   font=('Consolas', 9), wrap='word')
-        self.training_log.pack(side='left', fill='both', expand=True)
-        
-        log_scroll = tk.Scrollbar(log_frame, command=self.training_log.yview)
-        log_scroll.pack(side='right', fill='y')
-        self.training_log.config(yscrollcommand=log_scroll.set)
+        self.training_log = scrolledtext.ScrolledText(
+            log_frame,
+            height=20,
+            bg='#101010',
+            fg='#00ff88',
+            font=('Consolas', 12),
+            wrap='word',
+            insertbackground='white'
+        )
+        self.training_log.pack(fill='both', expand=True)
+        self._enable_text_mousewheel(self.training_log)
         
     def setup_prediction_tab(self):
         """Setup prediction tab"""
@@ -416,6 +468,24 @@ class CNNTrainingGUI:
                                      bg='#00ff88', fg='black', font=('Arial', 12, 'bold'), 
                                      width=15, height=2, cursor='hand2', state='disabled')
         self.predict_btn.grid(row=1, column=0, columnspan=2, padx=5, pady=10)
+
+        # Auto prediction controls
+        auto_pred_frame = tk.LabelFrame(self.prediction_tab, text=" 🤖 Auto SNR Prediction ",
+                        fg='white', bg='#2a2a2a', font=('Arial', 10, 'bold'))
+        auto_pred_frame.pack(fill='x', padx=10, pady=5)
+
+        tk.Label(auto_pred_frame,
+             text="Automatically evaluate every available SNR dataset (starting from your current selection) and export each report silently.",
+             fg='#ecf0f1', bg='#2a2a2a', font=('Arial', 10), wraplength=900, justify='left').pack(anchor='w', padx=10, pady=(5, 0))
+
+        status_row = tk.Frame(auto_pred_frame, bg='#2a2a2a')
+        status_row.pack(fill='x', padx=10, pady=5)
+        tk.Label(status_row, text="Status:", fg='#cccccc', bg='#2a2a2a', font=('Arial', 10, 'bold')).pack(side='left')
+        self.auto_prediction_status_label = tk.Label(status_row, text="Idle", fg='#95a5a6', bg='#2a2a2a', font=('Arial', 10))
+        self.auto_prediction_status_label.pack(side='left', padx=6)
+
+        tk.Button(auto_pred_frame, text="🚀 Start Auto SNR Prediction", command=self.start_auto_snr_prediction,
+              bg='#9b59b6', fg='white', font=('Arial', 11, 'bold'), width=32, cursor='hand2').pack(pady=(0, 8))
         
         # Prediction Results
         results_frame = tk.Frame(self.prediction_tab, bg='#2a2a2a', relief='ridge', bd=2)
@@ -458,13 +528,17 @@ class CNNTrainingGUI:
                                  fg='white', bg='#2a2a2a', font=('Arial', 10, 'bold'))
         log_frame.pack(fill='both', padx=10, pady=10, expand=True)
         
-        self.prediction_log = tk.Text(log_frame, height=15, bg='#1a1a1a', fg='#00d4ff', 
-                                     font=('Consolas', 9), wrap='word')
-        self.prediction_log.pack(side='left', fill='both', expand=True)
-        
-        pred_scroll = tk.Scrollbar(log_frame, command=self.prediction_log.yview)
-        pred_scroll.pack(side='right', fill='y')
-        self.prediction_log.config(yscrollcommand=pred_scroll.set)
+        self.prediction_log = scrolledtext.ScrolledText(
+            log_frame,
+            height=18,
+            bg='#101010',
+            fg='#00d4ff',
+            font=('Consolas', 12),
+            wrap='word',
+            insertbackground='white'
+        )
+        self.prediction_log.pack(fill='both', expand=True)
+        self._enable_text_mousewheel(self.prediction_log)
         
     def setup_results_tab(self):
         """Setup results and export tab"""
@@ -1591,7 +1665,11 @@ class CNNTrainingGUI:
                 acc_high = sorted_data[i + 1]['accuracy']
                 
                 degradation_rate = acc_high - acc_low
-                degradation_per_db = degradation_rate / (snr_high - snr_low)
+                
+                if snr_high - snr_low == 0:
+                    degradation_per_db = 0.0
+                else:
+                    degradation_per_db = degradation_rate / (snr_high - snr_low)
                 
                 # Classify degradation
                 if abs(degradation_per_db) < 0.5:
@@ -2863,9 +2941,13 @@ Key Findings:
     def log_explain(self, message):
         """Add message to explainability log"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.explain_log.insert(tk.END, f"[{timestamp}] {message}\\n")
-        self.explain_log.see(tk.END)
-        self.root.update()
+        formatted = f"[{timestamp}] {message}"
+        if hasattr(self, 'explain_log_queue'):
+            self.explain_log_queue.put(formatted)
+        else:
+            self.explain_log.insert(tk.END, formatted + "\n")
+            self.explain_log.see(tk.END)
+        print(f"[EXPLAIN] {formatted}")
     
     def export_explainability_pdf(self):
         """Export explainability analysis to PDF"""
@@ -3410,6 +3492,265 @@ WHY THIS PREDICTION?
             messagebox.showerror("Error", f"Failed to load model:\n{str(e)}")
             self.log_prediction(f"❌ Error loading model: {str(e)}")
     
+    # ========== AUTO SNR WORKFLOWS ==========
+
+    def start_auto_snr_training(self):
+        """Queue and run sequential trainings across SNR datasets."""
+        if self.is_training:
+            messagebox.showwarning("Training In Progress", "Finish the current training before starting auto mode.")
+            return
+
+        if self.auto_training_active:
+            messagebox.showinfo("Auto Training", "An auto SNR training session is already running.")
+            return
+
+        queue = self._build_snr_queue()
+        if not queue:
+            messagebox.showwarning("No SNR Datasets", "No SNR datasets were found on disk.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.join("auto_training_reports", f"session_{timestamp}")
+        os.makedirs(base_dir, exist_ok=True)
+
+        self.auto_training_queue = queue
+        self.auto_training_output_dir = base_dir
+        self.auto_training_active = True
+        if self.auto_training_status_label is not None:
+            self.auto_training_status_label.config(text=f"Queued {len(queue)} dataset(s)")
+
+        self.log_training("🤖 Auto SNR training session initialized")
+        for entry in queue:
+            self.log_training(f"   • {entry['display']} ({entry['name']})")
+
+        self._run_next_auto_training()
+
+    def start_auto_snr_prediction(self):
+        """Queue and run predictions across every available SNR dataset."""
+        if self.is_predicting:
+            messagebox.showwarning("Prediction In Progress", "Wait for the current prediction to finish first.")
+            return
+
+        if self.auto_prediction_active:
+            messagebox.showinfo("Auto Prediction", "Automatic SNR prediction is already running.")
+            return
+
+        if self.cnn_model is None or not self.cnn_model.is_fitted:
+            messagebox.showwarning("Model Required", "Load or train a CNN model before starting auto predictions.")
+            return
+
+        queue = self._build_snr_queue()
+        if not queue:
+            messagebox.showwarning("No SNR Datasets", "No SNR datasets were found on disk.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.join("auto_prediction_reports", f"session_{timestamp}")
+        os.makedirs(base_dir, exist_ok=True)
+
+        self.auto_prediction_queue = queue
+        self.auto_prediction_output_dir = base_dir
+        self.auto_prediction_active = True
+        
+        # Clear previous SNR degradation data for this new session
+        self.snr_degradation_data = []
+        
+        if self.auto_prediction_status_label is not None:
+            self.auto_prediction_status_label.config(text=f"Queued {len(queue)} dataset(s)")
+
+        self.log_prediction("🤖 Auto SNR prediction session initialized")
+        for entry in queue:
+            self.log_prediction(f"   • {entry['display']} ({entry['name']})")
+
+        self._run_next_auto_prediction()
+
+    def _build_snr_queue(self):
+        entries = []
+        for name, path in self.dataset_paths.items():
+            snr_value = self._extract_snr_value(name)
+            if snr_value is None:
+                continue
+            if not os.path.exists(path):
+                continue
+            entries.append({'name': name, 'snr': snr_value, 'display': f"SNR {snr_value} dB"})
+
+        entries.sort(key=lambda item: item['snr'])
+
+        current_value = self._extract_snr_value(self.dataset_var.get())
+        if current_value is not None:
+            entries = [entry for entry in entries if entry['snr'] >= current_value]
+
+        return entries
+
+    def _run_next_auto_training(self):
+        if not self.auto_training_active:
+            return
+
+        if not self.auto_training_queue:
+            self._finish_auto_training_session("Auto training complete ✅")
+            return
+
+        next_entry = self.auto_training_queue.pop(0)
+        self.auto_training_current = next_entry
+
+        if self.auto_training_status_label is not None:
+            self.auto_training_status_label.config(text=f"Training {next_entry['display']}")
+
+        if not self._load_dataset_for_auto(next_entry['name']):
+            self._handle_auto_training_failure(next_entry, "Dataset load failed")
+            return
+
+        context = {
+            'dataset_name': next_entry['name'],
+            'display': next_entry['display'],
+            'output_dir': self.auto_training_output_dir
+        }
+        self.start_training(auto_context=context)
+
+    def _run_next_auto_prediction(self):
+        if not self.auto_prediction_active:
+            return
+
+        if not self.auto_prediction_queue:
+            self._finish_auto_prediction_session("Auto prediction complete ✅")
+            return
+
+        next_entry = self.auto_prediction_queue.pop(0)
+        if self.auto_prediction_status_label is not None:
+            self.auto_prediction_status_label.config(text=f"Predicting {next_entry['display']}")
+
+        if not self._load_dataset_for_auto(next_entry['name'], log_fn=self.log_prediction):
+            self._handle_auto_prediction_failure(next_entry, "Dataset load failed")
+            return
+
+        self._update_prediction_status_label()
+
+        context = {
+            'dataset_name': next_entry['name'],
+            'display': next_entry['display'],
+            'output_dir': self.auto_prediction_output_dir
+        }
+        self.start_prediction(auto_context=context)
+
+    def _handle_auto_training_success(self, context):
+        if not self.auto_training_active:
+            return
+
+        dataset_name = context.get('dataset_name', 'dataset')
+        display = context.get('display', dataset_name)
+        output_dir = context.get('output_dir') or self.auto_training_output_dir
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            safe_name = dataset_name.replace('/', '_')
+            pdf_path = os.path.join(output_dir, f"{safe_name}_training_report.pdf")
+            csv_path = os.path.join(output_dir, f"{safe_name}_training_summary.csv")
+            self.export_to_pdf(filename=pdf_path, silent=True)
+            self.export_to_csv(filename=csv_path, silent=True)
+            self.log_training(f"📁 Saved analysis for {display} → {output_dir}")
+
+        if self.auto_training_queue:
+            if self.auto_training_status_label is not None:
+                self.auto_training_status_label.config(text="Advancing to next SNR…")
+            self.root.after(600, self._run_next_auto_training)
+        else:
+            self._finish_auto_training_session("Auto training complete ✅")
+
+    def _handle_auto_training_failure(self, context, error_message):
+        if not self.auto_training_active:
+            return
+        display = context.get('display', context.get('dataset_name', 'dataset'))
+        self.log_training(f"❌ Auto training stopped while processing {display}: {error_message}")
+        self._finish_auto_training_session("Auto training halted ❌")
+
+    def _handle_auto_prediction_success(self, context):
+        if not self.auto_prediction_active:
+            return
+
+        dataset_name = context.get('dataset_name', 'dataset')
+        display = context.get('display', dataset_name)
+        output_dir = context.get('output_dir') or self.auto_prediction_output_dir
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            safe_name = dataset_name.replace('/', '_')
+            pdf_path = os.path.join(output_dir, f"{safe_name}_prediction_report.pdf")
+            csv_path = os.path.join(output_dir, f"{safe_name}_prediction_results.csv")
+            self.export_to_pdf(filename=pdf_path, silent=True)
+            self.export_to_csv(filename=csv_path, silent=True)
+            self.log_prediction(f"📁 Saved analysis for {display} → {output_dir}")
+
+        if self.auto_prediction_queue:
+            if self.auto_prediction_status_label is not None:
+                self.auto_prediction_status_label.config(text="Advancing to next SNR…")
+            self.root.after(600, self._run_next_auto_prediction)
+        else:
+            self._finish_auto_prediction_session("Auto prediction complete ✅")
+
+    def _handle_auto_prediction_failure(self, context, error_message):
+        if not self.auto_prediction_active:
+            return
+        display = context.get('display', context.get('dataset_name', 'dataset'))
+        self.log_prediction(f"❌ Auto prediction stopped while processing {display}: {error_message}")
+        self._finish_auto_prediction_session("Auto prediction halted ❌")
+
+    def _finish_auto_training_session(self, message):
+        self.auto_training_active = False
+        self.auto_training_queue = []
+        self.auto_training_output_dir = None
+        self.auto_training_current = None
+        if self.auto_training_status_label is not None:
+            self.auto_training_status_label.config(text=message)
+        messagebox.showinfo("Auto Training", message)
+
+    def _finish_auto_prediction_session(self, message):
+        self.auto_prediction_active = False
+        self.auto_prediction_queue = []
+        self.auto_prediction_output_dir = None
+        if self.auto_prediction_status_label is not None:
+            self.auto_prediction_status_label.config(text=message)
+        messagebox.showinfo("Auto Prediction", message)
+
+    def _load_dataset_for_auto(self, dataset_name, log_fn=None):
+        """Load a dataset silently for automated workflows."""
+        log_callback = log_fn or self.log_training
+        self.dataset_var.set(dataset_name)
+        if self.mixed_snr_var.get():
+            self.mixed_snr_var.set(False)
+            self.toggle_snr_options()
+
+        previous_name = self.current_dataset_info.get('dataset_name')
+        self.load_dataset()
+
+        success = (
+            not self.current_dataset_info['is_mixed'] and
+            self.current_dataset_info['dataset_name'] == dataset_name and
+            self.train_data is not None and
+            self.val_data is not None and
+            self.test_data is not None
+        )
+
+        if not success:
+            log_callback(f"❌ Failed to prepare dataset {dataset_name} for auto workflow")
+            if previous_name:
+                self.dataset_var.set(previous_name)
+
+        return success
+
+    def _update_prediction_status_label(self):
+        if self.pred_dataset_status is None or self.test_data is None:
+            return
+        if self.current_dataset_info['is_mixed']:
+            mixed_names = ' + '.join(self.current_dataset_info['mixed_datasets'])
+            self.pred_dataset_status.config(text=f"✅ Mixed: {mixed_names}", fg='#00ff88')
+        else:
+            dataset_name = self.current_dataset_info['dataset_name']
+            self.pred_dataset_status.config(text=f"✅ Loaded: {dataset_name}", fg='#00ff88')
+
+    def _extract_snr_value(self, dataset_name):
+        match = re.search(r'snr[_-]?(\d+)', dataset_name.lower())
+        return int(match.group(1)) if match else None
+    
     # ========== TRAINING METHODS ==========
     
     def reset_training_ui(self):
@@ -3456,14 +3797,26 @@ WHY THIS PREDICTION?
         
         print("✅ UI reset complete!\n")
     
-    def start_training(self):
+    def start_training(self, auto_context=None):
         """Start training in a separate thread"""
         if self.train_data is None or self.val_data is None:
-            messagebox.showwarning("Warning", "Please load a dataset first!")
+            if auto_context:
+                self.log_training("❌ Auto training aborted - dataset not loaded")
+                self._handle_auto_training_failure(auto_context, "Dataset not loaded")
+            else:
+                messagebox.showwarning("Warning", "Please load a dataset first!")
             return
         
         if self.is_training:
-            messagebox.showwarning("Warning", "Training already in progress!")
+            if auto_context:
+                self.log_training("⚠️ Auto training waiting for current session to finish")
+                self.root.after(750, lambda ctx=auto_context: self.start_training(auto_context=ctx))
+            else:
+                messagebox.showwarning("Warning", "Training already in progress!")
+            return
+
+        if self.auto_training_active and auto_context is None:
+            messagebox.showwarning("Auto Session Running", "Wait for the auto SNR training to finish before starting a manual run.")
             return
         
         # RESET UI FIRST - Clear all previous training data
@@ -3484,7 +3837,7 @@ WHY THIS PREDICTION?
         self.is_training = True
         
         # Start training thread
-        training_thread = threading.Thread(target=self._training_thread, daemon=True)
+        training_thread = threading.Thread(target=self._training_thread, args=(auto_context,), daemon=True)
         training_thread.start()
     
     def stop_training(self):
@@ -3493,9 +3846,13 @@ WHY THIS PREDICTION?
         self.train_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.log_training("⏹️ Training stopped by user")
+        if self.auto_training_active:
+            self._finish_auto_training_session("Auto training stopped")
     
-    def _training_thread(self):
+    def _training_thread(self, auto_context=None):
         """Training thread with epoch-by-epoch updates"""
+        training_success = False
+        error_message = ""
         try:
             # Create and compile model with optimization settings
             print(f"\n{'='*60}")
@@ -3661,8 +4018,8 @@ WHY THIS PREDICTION?
                 self.epoch_history['val_loss'].append(history.history['val_loss'][0])
                 self.epoch_history['val_accuracy'].append(history.history['val_binary_accuracy'][0])
                 
-                # Update GUI
-                self.root.after(0, self.update_training_display)
+                # Update GUI (schedule on main thread)
+                self._queue_ui(self.update_training_display)
                 
                 # Log epoch results (this will also print to terminal)
                 self.log_training(f"   Loss: {history.history['loss'][0]:.4f} | Acc: {history.history['binary_accuracy'][0]:.4f}")
@@ -3713,21 +4070,30 @@ WHY THIS PREDICTION?
             self.log_training(f"\n✅ Training completed in {elapsed_time:.2f} seconds!")
             
             # Auto-save the model
-            self.root.after(0, self._auto_save_model)
+            self._queue_ui(self._auto_save_model)
             
             # Update summary
-            self.root.after(0, self.update_summary)
+            self._queue_ui(self.update_summary)
+            training_success = True
             
         except Exception as e:
             import traceback
             error_msg = f"❌ Training error: {str(e)}\n{traceback.format_exc()}"
             self.log_training(error_msg)
-            messagebox.showerror("Training Error", str(e))
+            error_message = str(e)
+            if auto_context is None:
+                self._queue_ui(lambda msg=str(e): messagebox.showerror("Training Error", msg))
         
         finally:
             self.is_training = False
-            self.train_btn.config(state='normal')
-            self.stop_btn.config(state='disabled')
+            self._queue_ui(lambda: self.train_btn.config(state='normal'))
+            self._queue_ui(lambda: self.stop_btn.config(state='disabled'))
+            if auto_context:
+                if training_success and self.auto_training_active:
+                    self._queue_ui(lambda ctx=auto_context: self._handle_auto_training_success(ctx))
+                else:
+                    msg = error_message or "Training failed"
+                    self._queue_ui(lambda ctx=auto_context, m=msg: self._handle_auto_training_failure(ctx, m))
     
     def update_training_display(self):
         """Update training display with current epoch info"""
@@ -3787,23 +4153,40 @@ WHY THIS PREDICTION?
     
     # ========== PREDICTION METHODS ==========
     
-    def start_prediction(self):
+    def start_prediction(self, auto_context=None):
         """Start prediction on test data"""
         if self.cnn_model is None or not self.cnn_model.is_fitted:
-            messagebox.showwarning("Warning", "Please train or load a model first!")
+            if auto_context:
+                self._handle_auto_prediction_failure(auto_context, "Model not loaded")
+            else:
+                messagebox.showwarning("Warning", "Please train or load a model first!")
             return
         
         if self.test_data is None:
-            messagebox.showwarning("Warning", "Please load a dataset first!\n\n⚠️ IMPORTANT: You must load the SAME dataset that was used for training!")
+            if auto_context:
+                self._handle_auto_prediction_failure(auto_context, "Dataset not loaded")
+            else:
+                messagebox.showwarning("Warning", "Please load a dataset first!\n\n⚠️ IMPORTANT: You must load the SAME dataset that was used for training!")
             return
         
         # Critical dataset validation
         if self.current_dataset_info['dataset_name'] is None:
-            messagebox.showwarning("Warning", "Dataset information missing!\n\nPlease reload the dataset that was used for training.")
+            if auto_context:
+                self._handle_auto_prediction_failure(auto_context, "Dataset metadata missing")
+            else:
+                messagebox.showwarning("Warning", "Dataset information missing!\n\nPlease reload the dataset that was used for training.")
             return
         
         if self.is_predicting:
-            messagebox.showwarning("Warning", "Prediction already in progress!")
+            if auto_context:
+                self.log_prediction("⚠️ Auto prediction waiting for current run to finish")
+                self.root.after(750, lambda ctx=auto_context: self.start_prediction(auto_context=ctx))
+            else:
+                messagebox.showwarning("Warning", "Prediction already in progress!")
+            return
+
+        if self.auto_prediction_active and auto_context is None:
+            messagebox.showwarning("Auto Session Running", "Wait for the auto SNR prediction cycle to finish before starting a manual run.")
             return
         
         # Show dataset warning for mixed datasets
@@ -3828,11 +4211,13 @@ WHY THIS PREDICTION?
         self.is_predicting = True
         
         # Start prediction thread
-        pred_thread = threading.Thread(target=self._prediction_thread, daemon=True)
+        pred_thread = threading.Thread(target=self._prediction_thread, args=(auto_context,), daemon=True)
         pred_thread.start()
     
-    def _prediction_thread(self):
+    def _prediction_thread(self, auto_context=None):
         """Prediction thread"""
+        prediction_success = False
+        error_message = ""
         try:
             num_samples = self.pred_samples_var.get()
             print(f"\n{'='*60}")
@@ -3921,8 +4306,8 @@ WHY THIS PREDICTION?
                         print(f"📊 Progress: {samples_processed}/{num_samples} ({progress_pct:.1f}%) | Running Accuracy: {acc:.2f}%")
                         self.log_prediction(f"Progress: {samples_processed}/{num_samples} | Accuracy: {acc:.2f}%")
             
-            # Update display
-            self.root.after(0, self.update_prediction_display)
+            # Update display on UI thread
+            self._queue_ui(self.update_prediction_display)
             
             # Calculate detailed classification report
             from sklearn.metrics import classification_report
@@ -4017,16 +4402,25 @@ WHY THIS PREDICTION?
             
             # Analyze SNR degradation if applicable
             self.analyze_snr_degradation()
+            prediction_success = True
             
         except Exception as e:
             import traceback
             error_msg = f"❌ Prediction error: {str(e)}\n{traceback.format_exc()}"
             self.log_prediction(error_msg)
-            messagebox.showerror("Prediction Error", str(e))
+            error_message = str(e)
+            if auto_context is None:
+                self._queue_ui(lambda msg=str(e): messagebox.showerror("Prediction Error", msg))
         
         finally:
             self.is_predicting = False
-            self.predict_btn.config(state='normal')
+            self._queue_ui(lambda: self.predict_btn.config(state='normal'))
+            if auto_context:
+                if prediction_success and self.auto_prediction_active:
+                    self._queue_ui(lambda ctx=auto_context: self._handle_auto_prediction_success(ctx))
+                else:
+                    msg = error_message or "Prediction failed"
+                    self._queue_ui(lambda ctx=auto_context, m=msg: self._handle_auto_prediction_failure(ctx, m))
     
     def update_prediction_display(self):
         """Update prediction metrics display"""
@@ -4069,26 +4463,31 @@ WHY THIS PREDICTION?
     
     # ========== EXPORT METHODS ==========
     
-    def export_to_pdf(self):
+    def export_to_pdf(self, filename=None, silent=False):
         """Export training results to PDF"""
         if self.cnn_model is None:
-            messagebox.showwarning("Warning", "No model to export!")
-            return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf")],
-            initialfile=f"CNN_Training_Report_{timestamp}.pdf"
-        )
+            warning_msg = "No model to export!"
+            if silent:
+                self.log_training(f"⚠️ {warning_msg}")
+            else:
+                messagebox.showwarning("Warning", warning_msg)
+            return None
         
         if not filename:
-            return
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".pdf",
+                filetypes=[("PDF files", "*.pdf")],
+                initialfile=f"CNN_Training_Report_{timestamp}.pdf"
+            )
+        
+        if not filename:
+            return None
         
         try:
             with PdfPages(filename) as pdf:
                 # Page 1: Title and Dataset Info
-                fig = plt.figure(figsize=(11, 8.5))
+                fig = Figure(figsize=(11, 8.5))
                 fig.text(0.5, 0.95, 'CNN Audio Classification Training Report', 
                         ha='center', fontsize=20, weight='bold')
                 fig.text(0.5, 0.90, f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', 
@@ -4168,10 +4567,11 @@ WHY THIS PREDICTION?
                         fig.text(0.1, y_pos, f"Efficiency: {samples_per_sec:.2f} samples/sec", fontsize=11)
                 
                 pdf.savefig(fig)
-                plt.close(fig)
+                # plt.close(fig)
                 
                 # Page 2: Training Curves
-                fig, axes = plt.subplots(2, 1, figsize=(11, 8.5))
+                fig = Figure(figsize=(11, 8.5))
+                axes = [fig.add_subplot(2, 1, 1), fig.add_subplot(2, 1, 2)]
                 
                 if len(self.epoch_history['epoch']) > 0:
                     epochs = self.epoch_history['epoch']
@@ -4194,13 +4594,14 @@ WHY THIS PREDICTION?
                     axes[1].legend()
                     axes[1].grid(True, alpha=0.3)
                 
-                plt.tight_layout()
+                fig.tight_layout()
                 pdf.savefig(fig)
-                plt.close(fig)
+                # plt.close(fig)
                 
                 # Page 3: Hardware Resource Usage Plots (if available)
                 if self.resource_stats and len(self.resource_data['timestamps']) > 0:
-                    fig, axes = plt.subplots(2, 1, figsize=(11, 8.5))
+                    fig = Figure(figsize=(11, 8.5))
+                    axes = [fig.add_subplot(2, 1, 1), fig.add_subplot(2, 1, 2)]
                     
                     # Convert timestamps to relative minutes
                     start_time = self.resource_data['timestamps'][0]
@@ -4227,13 +4628,13 @@ WHY THIS PREDICTION?
                                    linestyle='--', label=f'Average: {self.resource_stats["avg_memory_mb"]:.1f} MB')
                     axes[1].legend()
                     
-                    plt.tight_layout()
+                    fig.tight_layout()
                     pdf.savefig(fig)
-                    plt.close(fig)
+                    # plt.close(fig)
                 
                 # Page 4: Detailed Classification Report (if predictions were made)
                 if hasattr(self, 'classification_report') and self.classification_report.get('accuracy', 0) > 0:
-                    fig = plt.figure(figsize=(11, 8.5))
+                    fig = Figure(figsize=(11, 8.5))
                     fig.text(0.5, 0.95, 'Detailed Classification Report', 
                             ha='center', fontsize=18, weight='bold')
                     
@@ -4250,7 +4651,8 @@ WHY THIS PREDICTION?
                     y_pos -= 0.03
                     
                     # Draw horizontal line
-                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    line = Line2D([0.1, 0.9], [y_pos, y_pos], color='k', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    fig.add_artist(line)
                     y_pos -= 0.02
                     
                     # Class 0 (Fake)
@@ -4269,7 +4671,8 @@ WHY THIS PREDICTION?
                     fig.text(0.75, y_pos, f"{int(self.classification_report['class_1']['support'])}", fontsize=11)
                     y_pos -= 0.02
                     
-                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    line = Line2D([0.1, 0.9], [y_pos, y_pos], color='k', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    fig.add_artist(line)
                     y_pos -= 0.02
                     
                     # Accuracy
@@ -4307,11 +4710,11 @@ WHY THIS PREDICTION?
                     fig.text(0.1, y_pos, f"False Negatives (Real classified as Fake): {self.false_negatives}", fontsize=11)
                     
                     pdf.savefig(fig)
-                    plt.close(fig)
+                    # plt.close(fig)
                 
                 # Page 5: SNR Degradation Analysis (if available)
                 if len(self.snr_degradation_data) > 1:
-                    fig = plt.figure(figsize=(11, 8.5))
+                    fig = Figure(figsize=(11, 8.5))
                     fig.text(0.5, 0.95, 'Accuracy Degradation Rate Analysis', 
                             ha='center', fontsize=18, weight='bold')
                     
@@ -4327,7 +4730,8 @@ WHY THIS PREDICTION?
                     fig.text(0.35, y_pos, 'Degradation Rate', fontsize=12, weight='bold')
                     fig.text(0.65, y_pos, 'Classification', fontsize=12, weight='bold')
                     y_pos -= 0.03
-                    plt.plot([0.1, 0.9], [y_pos, y_pos], 'k-', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    line = Line2D([0.1, 0.9], [y_pos, y_pos], color='k', linewidth=1, transform=fig.transFigure, clip_on=False)
+                    fig.add_artist(line)
                     y_pos -= 0.02
                     
                     # Calculate degradation between consecutive SNR levels
@@ -4338,7 +4742,11 @@ WHY THIS PREDICTION?
                         acc_high = sorted_data[i + 1]['accuracy']
                         
                         degradation_rate = acc_high - acc_low
-                        degradation_per_db = degradation_rate / (snr_high - snr_low)
+                        
+                        if snr_high - snr_low == 0:
+                            degradation_per_db = 0.0
+                        else:
+                            degradation_per_db = degradation_rate / (snr_high - snr_low)
                         
                         # Classify degradation
                         if abs(degradation_per_db) < 0.5:
@@ -4368,28 +4776,41 @@ WHY THIS PREDICTION?
                     ax.grid(True, alpha=0.3)
                     
                     pdf.savefig(fig)
-                    plt.close(fig)
+                    # plt.close(fig)
             
-            messagebox.showinfo("Success", f"Report exported to:\n{filename}")
+            if silent:
+                self.log_training(f"📄 Training report exported to: {filename}")
+            else:
+                messagebox.showinfo("Success", f"Report exported to:\n{filename}")
+            return filename
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export PDF:\n{str(e)}")
+            if silent:
+                self.log_training(f"❌ Failed to export PDF: {str(e)}")
+            else:
+                messagebox.showerror("Error", f"Failed to export PDF:\n{str(e)}")
+            return None
     
-    def export_to_csv(self):
+    def export_to_csv(self, filename=None, silent=False):
         """Export prediction results to CSV"""
         if len(self.prediction_history) == 0:
-            messagebox.showwarning("Warning", "No prediction data to export!")
-            return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv")],
-            initialfile=f"CNN_Predictions_{timestamp}.csv"
-        )
+            warning_msg = "No prediction data to export!"
+            if silent:
+                self.log_prediction(f"⚠️ {warning_msg}")
+            else:
+                messagebox.showwarning("Warning", warning_msg)
+            return None
         
         if not filename:
-            return
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                initialfile=f"CNN_Predictions_{timestamp}.csv"
+            )
+        
+        if not filename:
+            return None
         
         try:
             with open(filename, 'w', newline='', encoding='utf-8') as f:
@@ -4553,10 +4974,18 @@ WHY THIS PREDICTION?
                         'Correct' if pred['correct'] else 'Incorrect'
                     ])
             
-            messagebox.showinfo("Success", f"Predictions exported to:\n{filename}")
+            if silent:
+                self.log_prediction(f"📄 Prediction CSV exported to: {filename}")
+            else:
+                messagebox.showinfo("Success", f"Predictions exported to:\n{filename}")
+            return filename
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to export CSV:\n{str(e)}")
+            if silent:
+                self.log_prediction(f"❌ Failed to export CSV: {str(e)}")
+            else:
+                messagebox.showerror("Error", f"Failed to export CSV:\n{str(e)}")
+            return None
     
     def _auto_save_model(self):
         """Automatically save model after training (deletes old model first)"""
@@ -4670,19 +5099,92 @@ WHY THIS PREDICTION?
 
     
     
+    def _queue_ui(self, func, *args, **kwargs):
+        """Schedule a callable to run on the Tk UI thread"""
+        if hasattr(self, 'ui_task_queue'):
+            self.ui_task_queue.put((func, args, kwargs))
+        else:
+            func(*args, **kwargs)
+
     def log_training(self, message):
-        """Log message to training log"""
-        self.training_log.insert('end', message + '\n')
-        self.training_log.see('end')
-        # Also print to terminal
+        """Queue training log messages for main-thread processing"""
+        if hasattr(self, 'training_log_queue'):
+            self.training_log_queue.put(message)
+        else:
+            self.training_log.insert('end', message + '\n')
+            self.training_log.see('end')
         print(f"[TRAINING] {message}")
     
     def log_prediction(self, message):
-        """Log message to prediction log"""
-        self.prediction_log.insert('end', message + '\n')
-        self.prediction_log.see('end')
-        # Also print to terminal
+        """Queue prediction log messages for main-thread processing"""
+        if hasattr(self, 'prediction_log_queue'):
+            self.prediction_log_queue.put(message)
+        else:
+            self.prediction_log.insert('end', message + '\n')
+            self.prediction_log.see('end')
         print(f"[PREDICTION] {message}")
+
+    def _process_training_log_queue(self):
+        try:
+            while True:
+                message = self.training_log_queue.get_nowait()
+                self.training_log.insert('end', message + '\n')
+                self.training_log.see('end')
+        except queue.Empty:
+            pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after(100, self._process_training_log_queue)
+            except tk.TclError:
+                pass
+
+    def _process_prediction_log_queue(self):
+        try:
+            while True:
+                message = self.prediction_log_queue.get_nowait()
+                self.prediction_log.insert('end', message + '\n')
+                self.prediction_log.see('end')
+        except queue.Empty:
+            pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after(100, self._process_prediction_log_queue)
+            except tk.TclError:
+                pass
+
+    def _process_explain_log_queue(self):
+        try:
+            while True:
+                message = self.explain_log_queue.get_nowait()
+                self.explain_log.insert(tk.END, message + '\n')
+                self.explain_log.see(tk.END)
+        except queue.Empty:
+            pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after(100, self._process_explain_log_queue)
+            except tk.TclError:
+                pass
+
+    def _process_ui_tasks(self):
+        try:
+            while True:
+                func, args, kwargs = self.ui_task_queue.get_nowait()
+                try:
+                    func(*args, **kwargs)
+                except Exception as exc:
+                    print(f"⚠️ UI task error: {exc}")
+        except queue.Empty:
+            pass
+        finally:
+            try:
+                if self.root.winfo_exists():
+                    self.root.after(50, self._process_ui_tasks)
+            except tk.TclError:
+                pass
     
     def update_summary(self):
         """Update training summary"""
